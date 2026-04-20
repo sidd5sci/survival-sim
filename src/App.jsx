@@ -2,6 +2,7 @@ import { Link, Navigate, Route, Routes, useNavigate, useParams } from 'react-rou
 import SurvivalSim3D from './simulations/sim1/sim.tsx'
 import GeneticTrianglesSim3D from './simulations/sim2/sim2.tsx'
 import NeuralVisionSim3D from './simulations/sim3/sim3.tsx'
+import CityEscapeSim3D from './simulations/sim4/sim4.tsx'
 import './App.css'
 
 const simulations = [
@@ -22,6 +23,12 @@ const simulations = [
     title: 'Neural Vision GA 3D',
     description: 'Agents with 5-unit vision evolve tiny neural networks where mutations can change weights, biases, neurons, and connections.',
     status: 'Ready',
+  },
+  {
+    id: 'city-escape-ai-3d',
+    title: 'City Escape AI 3D',
+    description: 'One articulated bot must escape a procedural city while enemies chase; vision is sent as a low-res matrix to a configurable AI endpoint.',
+    status: 'MVP',
   },
 ]
 
@@ -59,6 +66,7 @@ function SimulationView() {
   let simulation = <SurvivalSim3D />
   if (simulationId === 'genetic-triangles-3d') simulation = <GeneticTrianglesSim3D />
   if (simulationId === 'neural-vision-ga-3d') simulation = <NeuralVisionSim3D />
+  if (simulationId === 'city-escape-ai-3d') simulation = <CityEscapeSim3D />
 
   const validIds = new Set(simulations.map((s) => s.id))
   if (!simulationId || !validIds.has(simulationId)) {
