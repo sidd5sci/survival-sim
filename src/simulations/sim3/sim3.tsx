@@ -10,13 +10,16 @@ type Food = Vec2 & { id: string };
 type Obstacle = Vec2 & { id: string; size: number; height: number };
 
 type BrainGenome = {
+	hiddenLayers: number;
 	hiddenSize: number;
 	inputHiddenWeights: number[][];
 	inputHiddenMask: number[][];
-	hiddenBiases: number[];
+	hiddenBiases: number[][];
+	hiddenHiddenWeights: number[][][];
+	hiddenHiddenMask: number[][][];
 	hiddenOutputWeights: number[][];
 	hiddenOutputMask: number[][];
-	outputBiases: [number, number];
+	outputBiases: number[];
 };
 
 type Agent = {
@@ -25,6 +28,10 @@ type Agent = {
 	z: number;
 	vx: number;
 	vz: number;
+	headingX: number;
+	headingZ: number;
+	energy: number;
+	alive: boolean;
 	foodsEaten: number;
 	firstFoodTime: number | null;
 	minFoodDistance: number;
@@ -35,8 +42,8 @@ type Agent = {
 	// Brain: runtime neural net state (not inherited). Useful for inspection/debugging.
 	brain: {
 		inputs: number[];
-		hidden: number[];
-		outputs: [number, number];
+		hidden: number[][];
+		outputs: number[];
 	};
 	eatenMask: boolean[];
 };
@@ -70,12 +77,31 @@ const FOOD_RADIUS = 0.6;
 const GENERATION_SECONDS = 300;
 const FOOD_COUNT = 8;
 const OBSTACLE_COUNT = 13;
-const VISION_RADIUS = 5;
+const DEFAULT_VISION_RADIUS = 5;
 const INPUTS = 8;
-const OUTPUTS = 2;
+const OUTPUTS = 5;
+const OUT_LEFT = 0;
+const OUT_RIGHT = 1;
+const OUT_FORWARD = 2;
+const OUT_BACKWARD = 3;
+const OUT_SPEED = 4;
 const MAX_SPEED = 4.9;
 const ACCEL = 8.5;
 const DRAG = 0.89;
+
+const MAX_HIDDEN_LAYERS = 5;
+
+const START_ENERGY = 100;
+const MAX_ENERGY = 150;
+const ENERGY_GAIN_PER_FOOD = 25;
+const ENERGY_DRAIN_BASE_PER_SEC = 0.04;
+const ENERGY_DRAIN_SPEED_PER_UNIT = 0.06;
+const ENERGY_DRAIN_ACCEL_PER_UNIT = 0.015;
+const DEAD_FITNESS_PENALTY = 2000;
+
+const VISION_FOV_DEG = 120;
+const VISION_HALF_FOV_RAD = (VISION_FOV_DEG * Math.PI) / 360;
+const VISION_COS_THRESHOLD = Math.cos(VISION_HALF_FOV_RAD);
 
 function clamp(v: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, v));
@@ -140,32 +166,55 @@ function randomMask(): number {
 	return Math.random() < 0.7 ? 1 : 0;
 }
 
-function createRandomGenome(hiddenSize = Math.floor(rand(3, 8))): BrainGenome {
+function createRandomGenome(hiddenSize = Math.floor(rand(3, 8)), hiddenLayers = Math.floor(rand(1, 3))): BrainGenome {
+	const layers = clamp(hiddenLayers, 1, MAX_HIDDEN_LAYERS);
 	const inputHiddenWeights = Array.from({ length: INPUTS }, () => Array.from({ length: hiddenSize }, randomWeight));
 	const inputHiddenMask = Array.from({ length: INPUTS }, () => Array.from({ length: hiddenSize }, randomMask));
-	const hiddenBiases = Array.from({ length: hiddenSize }, randomWeight);
+	const hiddenBiases = Array.from({ length: layers }, () => Array.from({ length: hiddenSize }, randomWeight));
+	const hiddenHiddenWeights = Array.from({ length: Math.max(0, layers - 1) }, () =>
+		Array.from({ length: hiddenSize }, () => Array.from({ length: hiddenSize }, randomWeight)),
+	);
+	const hiddenHiddenMask = Array.from({ length: Math.max(0, layers - 1) }, () =>
+		Array.from({ length: hiddenSize }, () => Array.from({ length: hiddenSize }, randomMask)),
+	);
 	const hiddenOutputWeights = Array.from({ length: hiddenSize }, () => Array.from({ length: OUTPUTS }, randomWeight));
 	const hiddenOutputMask = Array.from({ length: hiddenSize }, () => Array.from({ length: OUTPUTS }, randomMask));
-	const outputBiases: [number, number] = [randomWeight(), randomWeight()];
+	const outputBiases = Array.from({ length: OUTPUTS }, randomWeight);
 
-	return { hiddenSize, inputHiddenWeights, inputHiddenMask, hiddenBiases, hiddenOutputWeights, hiddenOutputMask, outputBiases };
+	return {
+		hiddenLayers: layers,
+		hiddenSize,
+		inputHiddenWeights,
+		inputHiddenMask,
+		hiddenBiases,
+		hiddenHiddenWeights,
+		hiddenHiddenMask,
+		hiddenOutputWeights,
+		hiddenOutputMask,
+		outputBiases,
+	};
 }
 
 function cloneGenome(genome: BrainGenome): BrainGenome {
 	return {
+		hiddenLayers: genome.hiddenLayers,
 		hiddenSize: genome.hiddenSize,
 		inputHiddenWeights: genome.inputHiddenWeights.map((row) => [...row]),
 		inputHiddenMask: genome.inputHiddenMask.map((row) => [...row]),
-		hiddenBiases: [...genome.hiddenBiases],
+		hiddenBiases: genome.hiddenBiases.map((row) => [...row]),
+		hiddenHiddenWeights: genome.hiddenHiddenWeights.map((m) => m.map((row) => [...row])),
+		hiddenHiddenMask: genome.hiddenHiddenMask.map((m) => m.map((row) => [...row])),
 		hiddenOutputWeights: genome.hiddenOutputWeights.map((row) => [...row]),
 		hiddenOutputMask: genome.hiddenOutputMask.map((row) => [...row]),
-		outputBiases: [genome.outputBiases[0], genome.outputBiases[1]],
+		outputBiases: [...genome.outputBiases],
 	};
 }
 
-function resizeGenome(genome: BrainGenome, nextHiddenSize: number): BrainGenome {
-	const resized = createRandomGenome(nextHiddenSize);
+
+function resizeGenome(genome: BrainGenome, nextHiddenSize: number, nextHiddenLayers: number): BrainGenome {
+	const resized = createRandomGenome(nextHiddenSize, nextHiddenLayers);
 	const overlap = Math.min(genome.hiddenSize, nextHiddenSize);
+	const layerOverlap = Math.min(genome.hiddenLayers, resized.hiddenLayers);
 
 	for (let i = 0; i < INPUTS; i += 1) {
 		for (let h = 0; h < overlap; h += 1) {
@@ -174,15 +223,32 @@ function resizeGenome(genome: BrainGenome, nextHiddenSize: number): BrainGenome 
 		}
 	}
 
+	for (let l = 0; l < layerOverlap; l += 1) {
+		for (let h = 0; h < overlap; h += 1) {
+			resized.hiddenBiases[l][h] = genome.hiddenBiases[l][h];
+		}
+	}
+
+	const hhOverlap = Math.min(Math.max(0, genome.hiddenLayers - 1), Math.max(0, resized.hiddenLayers - 1));
+	for (let l = 0; l < hhOverlap; l += 1) {
+		for (let i = 0; i < overlap; i += 1) {
+			for (let h = 0; h < overlap; h += 1) {
+				resized.hiddenHiddenWeights[l][i][h] = genome.hiddenHiddenWeights[l][i][h];
+				resized.hiddenHiddenMask[l][i][h] = genome.hiddenHiddenMask[l][i][h];
+			}
+		}
+	}
+
 	for (let h = 0; h < overlap; h += 1) {
-		resized.hiddenBiases[h] = genome.hiddenBiases[h];
 		for (let o = 0; o < OUTPUTS; o += 1) {
 			resized.hiddenOutputWeights[h][o] = genome.hiddenOutputWeights[h][o];
 			resized.hiddenOutputMask[h][o] = genome.hiddenOutputMask[h][o];
 		}
 	}
 
-	resized.outputBiases = [genome.outputBiases[0], genome.outputBiases[1]];
+	for (let o = 0; o < OUTPUTS; o += 1) {
+		if (genome.outputBiases[o] != null) resized.outputBiases[o] = genome.outputBiases[o];
+	}
 	return resized;
 }
 
@@ -190,9 +256,11 @@ function mutateGenome(parent: BrainGenome, settings: EvoSettings): BrainGenome {
 	let genome = cloneGenome(parent);
 
 	if (Math.random() < settings.topologyMutationRate) {
-		const delta = Math.random() < 0.5 ? -1 : 1;
-		const newSize = clamp(genome.hiddenSize + delta, 2, 12);
-		genome = resizeGenome(genome, newSize);
+		const deltaSize = Math.random() < 0.5 ? -1 : 1;
+		const deltaLayers = Math.random() < 0.5 ? -1 : 1;
+		const newSize = clamp(genome.hiddenSize + deltaSize, 2, 12);
+		const newLayers = clamp(genome.hiddenLayers + deltaLayers, 1, MAX_HIDDEN_LAYERS);
+		genome = resizeGenome(genome, newSize, newLayers);
 	}
 
 	for (let i = 0; i < INPUTS; i += 1) {
@@ -206,10 +274,28 @@ function mutateGenome(parent: BrainGenome, settings: EvoSettings): BrainGenome {
 		}
 	}
 
-	for (let h = 0; h < genome.hiddenSize; h += 1) {
-		if (Math.random() < settings.mutationRate) {
-			genome.hiddenBiases[h] += rand(-settings.mutationStrength, settings.mutationStrength);
+	for (let l = 0; l < genome.hiddenLayers; l += 1) {
+		for (let h = 0; h < genome.hiddenSize; h += 1) {
+			if (Math.random() < settings.mutationRate) {
+				genome.hiddenBiases[l][h] += rand(-settings.mutationStrength, settings.mutationStrength);
+			}
 		}
+	}
+
+	for (let l = 0; l < Math.max(0, genome.hiddenLayers - 1); l += 1) {
+		for (let i = 0; i < genome.hiddenSize; i += 1) {
+			for (let h = 0; h < genome.hiddenSize; h += 1) {
+				if (Math.random() < settings.mutationRate) {
+					genome.hiddenHiddenWeights[l][i][h] += rand(-settings.mutationStrength, settings.mutationStrength);
+				}
+				if (Math.random() < settings.mutationRate * 0.4) {
+					genome.hiddenHiddenMask[l][i][h] = genome.hiddenHiddenMask[l][i][h] > 0.5 ? 0 : 1;
+				}
+			}
+		}
+	}
+
+	for (let h = 0; h < genome.hiddenSize; h += 1) {
 		for (let o = 0; o < OUTPUTS; o += 1) {
 			if (Math.random() < settings.mutationRate) {
 				genome.hiddenOutputWeights[h][o] += rand(-settings.mutationStrength, settings.mutationStrength);
@@ -233,9 +319,12 @@ function crossoverGenomes(a: BrainGenome, b: BrainGenome, crossoverRate: number)
 	if (Math.random() > crossoverRate) return cloneGenome(a);
 
 	const hiddenSize = Math.random() < 0.5 ? a.hiddenSize : b.hiddenSize;
-	const ra = resizeGenome(a, hiddenSize);
-	const rb = resizeGenome(b, hiddenSize);
-	const child = createRandomGenome(hiddenSize);
+	let hiddenLayers = Math.random() < 0.5 ? a.hiddenLayers : b.hiddenLayers;
+	// Allow child to gain a hidden layer during crossover.
+	if (Math.random() < 0.22) hiddenLayers = clamp(hiddenLayers + 1, 1, MAX_HIDDEN_LAYERS);
+	const ra = resizeGenome(a, hiddenSize, hiddenLayers);
+	const rb = resizeGenome(b, hiddenSize, hiddenLayers);
+	const child = createRandomGenome(hiddenSize, hiddenLayers);
 
 	for (let i = 0; i < INPUTS; i += 1) {
 		for (let h = 0; h < hiddenSize; h += 1) {
@@ -245,8 +334,23 @@ function crossoverGenomes(a: BrainGenome, b: BrainGenome, crossoverRate: number)
 		}
 	}
 
+	for (let l = 0; l < hiddenLayers; l += 1) {
+		for (let h = 0; h < hiddenSize; h += 1) {
+			child.hiddenBiases[l][h] = Math.random() < 0.5 ? ra.hiddenBiases[l][h] : rb.hiddenBiases[l][h];
+		}
+	}
+
+	for (let l = 0; l < Math.max(0, hiddenLayers - 1); l += 1) {
+		for (let i = 0; i < hiddenSize; i += 1) {
+			for (let h = 0; h < hiddenSize; h += 1) {
+				const chooseA = Math.random() < 0.5;
+				child.hiddenHiddenWeights[l][i][h] = chooseA ? ra.hiddenHiddenWeights[l][i][h] : rb.hiddenHiddenWeights[l][i][h];
+				child.hiddenHiddenMask[l][i][h] = chooseA ? ra.hiddenHiddenMask[l][i][h] : rb.hiddenHiddenMask[l][i][h];
+			}
+		}
+	}
+
 	for (let h = 0; h < hiddenSize; h += 1) {
-		child.hiddenBiases[h] = Math.random() < 0.5 ? ra.hiddenBiases[h] : rb.hiddenBiases[h];
 		for (let o = 0; o < OUTPUTS; o += 1) {
 			const chooseA = Math.random() < 0.5;
 			child.hiddenOutputWeights[h][o] = chooseA ? ra.hiddenOutputWeights[h][o] : rb.hiddenOutputWeights[h][o];
@@ -254,7 +358,9 @@ function crossoverGenomes(a: BrainGenome, b: BrainGenome, crossoverRate: number)
 		}
 	}
 
-	child.outputBiases = [Math.random() < 0.5 ? ra.outputBiases[0] : rb.outputBiases[0], Math.random() < 0.5 ? ra.outputBiases[1] : rb.outputBiases[1]];
+	for (let o = 0; o < OUTPUTS; o += 1) {
+		child.outputBiases[o] = Math.random() < 0.5 ? ra.outputBiases[o] : rb.outputBiases[o];
+	}
 	return child;
 }
 
@@ -265,6 +371,10 @@ function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
 		z: start.z + rand(-0.8, 0.8),
 		vx: 0,
 		vz: 0,
+		headingX: 0,
+		headingZ: 1,
+		energy: START_ENERGY,
+		alive: true,
 		foodsEaten: 0,
 		firstFoodTime: null,
 		minFoodDistance: nearestFoodDistance(start, foods),
@@ -273,8 +383,8 @@ function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
 		genome,
 		brain: {
 			inputs: new Array(INPUTS).fill(0),
-			hidden: new Array(genome.hiddenSize).fill(0),
-			outputs: [0, 0],
+			hidden: Array.from({ length: genome.hiddenLayers }, () => new Array(genome.hiddenSize).fill(0)),
+			outputs: new Array(OUTPUTS).fill(0),
 		},
 		eatenMask: new Array(foods.length).fill(false),
 	};
@@ -297,25 +407,39 @@ function createInitialState(settings: EvoSettings): SimState {
 	};
 }
 
-function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[]): number[] {
+function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], visionRadius: number): number[] {
+	const hx = agent.headingX;
+	const hz = agent.headingZ;
+	// Right vector in XZ plane (90° clockwise from forward).
+	const rx = hz;
+	const rz = -hx;
+
 	let nearestFood: Food | null = null;
-	let nearestFoodDist = VISION_RADIUS + 1;
+	let nearestFoodDist = visionRadius + 1;
 
 	for (let i = 0; i < foods.length; i += 1) {
 		if (agent.eatenMask[i]) continue;
 		const d = dist(agent, foods[i]);
-		if (d <= VISION_RADIUS && d < nearestFoodDist) {
+		if (d > visionRadius || d >= nearestFoodDist) continue;
+		const nxz = normalize(foods[i].x - agent.x, foods[i].z - agent.z);
+		const dot = nxz.x * hx + nxz.z * hz;
+		if (dot < VISION_COS_THRESHOLD) continue;
+		{
 			nearestFoodDist = d;
 			nearestFood = foods[i];
 		}
 	}
 
 	let nearestObs: Obstacle | null = null;
-	let nearestObsDist = VISION_RADIUS + 1;
+	let nearestObsDist = visionRadius + 1;
 
 	for (const obstacle of obstacles) {
 		const d = Math.max(0, dist(agent, obstacle) - obstacle.size);
-		if (d <= VISION_RADIUS && d < nearestObsDist) {
+		if (d > visionRadius || d >= nearestObsDist) continue;
+		const nxz = normalize(obstacle.x - agent.x, obstacle.z - agent.z);
+		const dot = nxz.x * hx + nxz.z * hz;
+		if (dot < VISION_COS_THRESHOLD) continue;
+		{
 			nearestObsDist = d;
 			nearestObs = obstacle;
 		}
@@ -326,9 +450,10 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[]): nu
 	let foodDist = 0;
 	if (nearestFood) {
 		const n = normalize(nearestFood.x - agent.x, nearestFood.z - agent.z);
-		foodDx = n.x;
-		foodDz = n.z;
-		foodDist = 1 - clamp(nearestFoodDist / VISION_RADIUS, 0, 1);
+		// Creature-local direction: x=right, z=forward.
+		foodDx = n.x * rx + n.z * rz;
+		foodDz = n.x * hx + n.z * hz;
+		foodDist = 1 - clamp(nearestFoodDist / Math.max(visionRadius, 0.0001), 0, 1);
 	}
 
 	let obsDx = 0;
@@ -336,9 +461,10 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[]): nu
 	let obsDist = 0;
 	if (nearestObs) {
 		const n = normalize(nearestObs.x - agent.x, nearestObs.z - agent.z);
-		obsDx = n.x;
-		obsDz = n.z;
-		obsDist = 1 - clamp(nearestObsDist / VISION_RADIUS, 0, 1);
+		// Creature-local direction: x=right, z=forward.
+		obsDx = n.x * rx + n.z * rz;
+		obsDz = n.x * hx + n.z * hz;
+		obsDist = 1 - clamp(nearestObsDist / Math.max(visionRadius, 0.0001), 0, 1);
 	}
 
 	return [
@@ -361,72 +487,99 @@ function neuralSteer(genome: BrainGenome, inputs: number[]): Vec2 {
 // Forward pass through the creature's neural net.
 // Returns both movement steering (phenotype) and intermediate activations for learning + visualization.
 function forwardPass(genome: BrainGenome, inputs: number[]) {
-	const hidden = new Array(genome.hiddenSize).fill(0);
+	const hiddenLayers: number[][] = Array.from({ length: genome.hiddenLayers }, () => new Array(genome.hiddenSize).fill(0));
 
+	// Input -> first hidden
 	for (let h = 0; h < genome.hiddenSize; h += 1) {
-		let sum = genome.hiddenBiases[h];
+		let sum = genome.hiddenBiases[0][h];
 		for (let i = 0; i < INPUTS; i += 1) {
 			if (genome.inputHiddenMask[i][h] > 0.5) sum += inputs[i] * genome.inputHiddenWeights[i][h];
 		}
-		hidden[h] = Math.tanh(sum);
+		hiddenLayers[0][h] = Math.tanh(sum);
 	}
 
-	const out: [number, number] = [genome.outputBiases[0], genome.outputBiases[1]];
-	for (let h = 0; h < genome.hiddenSize; h += 1) {
-		for (let o = 0; o < OUTPUTS; o += 1) {
-			if (genome.hiddenOutputMask[h][o] > 0.5) out[o] += hidden[h] * genome.hiddenOutputWeights[h][o];
+	// Hidden -> hidden
+	for (let l = 1; l < genome.hiddenLayers; l += 1) {
+		for (let h = 0; h < genome.hiddenSize; h += 1) {
+			let sum = genome.hiddenBiases[l][h];
+			for (let i = 0; i < genome.hiddenSize; i += 1) {
+				if (genome.hiddenHiddenMask[l - 1][i][h] > 0.5) sum += hiddenLayers[l - 1][i] * genome.hiddenHiddenWeights[l - 1][i][h];
+			}
+			hiddenLayers[l][h] = Math.tanh(sum);
 		}
 	}
 
+	const lastHidden = hiddenLayers[genome.hiddenLayers - 1];
+
+	const out = new Array(OUTPUTS).fill(0);
+	for (let o = 0; o < OUTPUTS; o += 1) out[o] = genome.outputBiases[o] ?? 0;
+	for (let h = 0; h < genome.hiddenSize; h += 1) {
+		for (let o = 0; o < OUTPUTS; o += 1) {
+			if (genome.hiddenOutputMask[h][o] > 0.5) out[o] += lastHidden[h] * genome.hiddenOutputWeights[h][o];
+		}
+	}
+
+	// Output neurons are fixed actions:
+	// left, right, forward, backward, speed.
+	const act = out.map((v) => Math.tanh(v));
+	let rawX = clamp((act[OUT_RIGHT] ?? 0) - (act[OUT_LEFT] ?? 0), -1, 1);
+	let rawZ = clamp((act[OUT_FORWARD] ?? 0) - (act[OUT_BACKWARD] ?? 0), -1, 1);
+
 	// IMPORTANT: Don't normalize tiny outputs to a unit vector.
 	// Normalizing near-zero vectors makes agents move in arbitrary circles instead of stopping.
-	const rawX = Math.tanh(out[0]);
-	const rawZ = Math.tanh(out[1]);
 	const mag = Math.sqrt(rawX * rawX + rawZ * rawZ);
-	const steer = mag < 0.08 ? { x: 0, z: 0 } : { x: rawX / mag, z: rawZ / mag };
+	const steer = mag < 0.08 ? { x: 0, z: 0 } : mag > 1 ? { x: rawX / mag, z: rawZ / mag } : { x: rawX, z: rawZ };
 
-	return { hidden, out, steer };
+	const speed01 = clamp(((act[OUT_SPEED] ?? 0) + 1) * 0.5, 0, 1);
+
+	return { hiddenLayers, out, steer, speed01 };
 }
 
 // Simple (optional) on-policy learning that writes back into DNA (Lamarckian).
 // This is intentionally lightweight and heuristic: if a creature makes progress toward food,
 // it slightly reinforces the weights that produced that action.
-function learnGenome(genome: BrainGenome, inputs: number[], hidden: number[], out: [number, number], reward: number, learningRate: number): BrainGenome {
+function learnGenome(genome: BrainGenome, inputs: number[], hiddenLayers: number[][], out: number[], reward: number, learningRate: number): BrainGenome {
 	if (!Number.isFinite(reward) || Math.abs(reward) < 1e-6) return genome;
 	const lr = learningRate * reward;
+	const firstHidden = hiddenLayers[0] ?? new Array(genome.hiddenSize).fill(0);
+	const lastHidden = hiddenLayers[genome.hiddenLayers - 1] ?? firstHidden;
 
 	const next: BrainGenome = {
+		hiddenLayers: genome.hiddenLayers,
 		hiddenSize: genome.hiddenSize,
 		inputHiddenWeights: genome.inputHiddenWeights.map((row) => [...row]),
 		inputHiddenMask: genome.inputHiddenMask.map((row) => [...row]),
-		hiddenBiases: [...genome.hiddenBiases],
+		hiddenBiases: genome.hiddenBiases.map((row) => [...row]),
+		hiddenHiddenWeights: genome.hiddenHiddenWeights.map((m) => m.map((row) => [...row])),
+		hiddenHiddenMask: genome.hiddenHiddenMask.map((m) => m.map((row) => [...row])),
 		hiddenOutputWeights: genome.hiddenOutputWeights.map((row) => [...row]),
 		hiddenOutputMask: genome.hiddenOutputMask.map((row) => [...row]),
-		outputBiases: [genome.outputBiases[0], genome.outputBiases[1]],
+		outputBiases: [...genome.outputBiases],
 	};
 
 	// Output layer reinforcement
 	for (let h = 0; h < next.hiddenSize; h += 1) {
 		for (let o = 0; o < OUTPUTS; o += 1) {
 			if (next.hiddenOutputMask[h][o] > 0.5) {
-				next.hiddenOutputWeights[h][o] = clamp(next.hiddenOutputWeights[h][o] + lr * hidden[h] * Math.tanh(out[o]), -3, 3);
+				next.hiddenOutputWeights[h][o] = clamp(next.hiddenOutputWeights[h][o] + lr * lastHidden[h] * Math.tanh(out[o] ?? 0), -3, 3);
 			}
 		}
 	}
 	for (let o = 0; o < OUTPUTS; o += 1) {
-		next.outputBiases[o] = clamp(next.outputBiases[o] + lr * Math.tanh(out[o]) * 0.25, -3, 3);
+		next.outputBiases[o] = clamp(next.outputBiases[o] + lr * Math.tanh(out[o] ?? 0) * 0.25, -3, 3);
 	}
 
 	// Hidden layer reinforcement
 	for (let i = 0; i < INPUTS; i += 1) {
 		for (let h = 0; h < next.hiddenSize; h += 1) {
 			if (next.inputHiddenMask[i][h] > 0.5) {
-				next.inputHiddenWeights[i][h] = clamp(next.inputHiddenWeights[i][h] + lr * inputs[i] * hidden[h] * 0.15, -3, 3);
+				next.inputHiddenWeights[i][h] = clamp(next.inputHiddenWeights[i][h] + lr * inputs[i] * firstHidden[h] * 0.15, -3, 3);
 			}
 		}
 	}
 	for (let h = 0; h < next.hiddenSize; h += 1) {
-		next.hiddenBiases[h] = clamp(next.hiddenBiases[h] + lr * hidden[h] * 0.1, -3, 3);
+		next.hiddenBiases[0][h] = clamp(next.hiddenBiases[0][h] + lr * firstHidden[h] * 0.1, -3, 3);
+		next.hiddenBiases[next.hiddenLayers - 1][h] = clamp(next.hiddenBiases[next.hiddenLayers - 1][h] + lr * lastHidden[h] * 0.05, -3, 3);
 	}
 
 	return next;
@@ -436,7 +589,8 @@ function computeFitness(agent: Agent, elapsed: number, initialNearest: number): 
 	const progress = clamp(initialNearest - agent.minFoodDistance, 0, initialNearest);
 	const speedReward = progress / Math.max(elapsed, 1);
 	const firstFoodBonus = agent.firstFoodTime == null ? 0 : Math.max(0, GENERATION_SECONDS - agent.firstFoodTime) * 0.65;
-	return agent.foodsEaten * 1500 + progress * 10 + speedReward * 500 + firstFoodBonus - agent.collisions * 16;
+	const alivePenalty = agent.alive ? 0 : DEAD_FITNESS_PENALTY;
+	return agent.foodsEaten * 1500 + progress * 10 + speedReward * 500 + firstFoodBonus - agent.collisions * 16 - alivePenalty;
 }
 
 function selectParent(pool: Agent[]): Agent {
@@ -489,39 +643,89 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	};
 }
 
-function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, startPos: Vec2): SimState {
+function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, startPos: Vec2, visionRadius: number): SimState {
 	const elapsed = prev.elapsedSeconds + dt;
 	const baseNearest = nearestFoodDistance(startPos, prev.foods);
 
 	const updatedAgents = prev.agents.map((agent) => {
-		const inputs = getVisionInputs(agent, prev.foods, prev.obstacles);
-		const { hidden, out, steer } = forwardPass(agent.genome, inputs);
-
-		let vx = (agent.vx + steer.x * ACCEL * dt) * DRAG;
-		let vz = (agent.vz + steer.z * ACCEL * dt) * DRAG;
-		const speed = Math.sqrt(vx * vx + vz * vz) || 1;
-		if (speed > MAX_SPEED) {
-			vx = (vx / speed) * MAX_SPEED;
-			vz = (vz / speed) * MAX_SPEED;
+		if (!agent.alive || agent.energy <= 0) {
+			const deadAgent: Agent = {
+				...agent,
+				alive: false,
+				energy: 0,
+				vx: 0,
+				vz: 0,
+				fitness: 0,
+			};
+			deadAgent.fitness = computeFitness(deadAgent, elapsed, baseNearest);
+			return deadAgent;
 		}
 
-		let x = clamp(agent.x + vx * dt, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
-		let z = clamp(agent.z + vz * dt, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
-		let collisions = agent.collisions;
+		const inputs = getVisionInputs(agent, prev.foods, prev.obstacles, visionRadius);
+		const { hiddenLayers, out, steer, speed01 } = forwardPass(agent.genome, inputs);
+		const desiredMaxSpeed = MAX_SPEED * speed01;
+
+		const prevVx = agent.vx;
+		const prevVz = agent.vz;
+		let vx = agent.vx;
+		let vz = agent.vz;
+		let x = agent.x;
+		let z = agent.z;
 		let collidedThisStep = false;
 
-		for (const obstacle of prev.obstacles) {
-			const dx = x - obstacle.x;
-			const dz = z - obstacle.z;
-			const d = Math.sqrt(dx * dx + dz * dz) || 0.0001;
-			const minD = obstacle.size + AGENT_RADIUS;
-			if (d < minD) {
-				x = obstacle.x + (dx / d) * minD;
-				z = obstacle.z + (dz / d) * minD;
-				collisions += 1;
-				collidedThisStep = true;
+		// Sub-step integration to prevent tunneling through obstacles.
+		const ax = steer.x * ACCEL * speed01;
+		const az = steer.z * ACCEL * speed01;
+		const estSpeed = Math.sqrt(vx * vx + vz * vz);
+		const maxStepDist = Math.max(AGENT_RADIUS * 0.75, 0.12);
+		const steps = clamp(Math.ceil((estSpeed * dt) / maxStepDist), 1, 18);
+		const dtStep = dt / steps;
+		const dragFactor = Math.pow(DRAG, 1 / steps);
+
+		for (let s = 0; s < steps; s += 1) {
+			vx = (vx + ax * dtStep) * dragFactor;
+			vz = (vz + az * dtStep) * dragFactor;
+			const speedNow = Math.sqrt(vx * vx + vz * vz) || 1;
+			if (speedNow > Math.max(desiredMaxSpeed, 0.0001)) {
+				vx = (vx / speedNow) * desiredMaxSpeed;
+				vz = (vz / speedNow) * desiredMaxSpeed;
+			}
+
+			x = clamp(x + vx * dtStep, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+			z = clamp(z + vz * dtStep, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+
+			for (const obstacle of prev.obstacles) {
+				const dx = x - obstacle.x;
+				const dz = z - obstacle.z;
+				const d = Math.sqrt(dx * dx + dz * dz) || 0.0001;
+				const minD = obstacle.size + AGENT_RADIUS;
+				if (d < minD) {
+					x = obstacle.x + (dx / d) * minD;
+					z = obstacle.z + (dz / d) * minD;
+					collidedThisStep = true;
+				}
 			}
 		}
+
+		const speed = Math.sqrt(vx * vx + vz * vz);
+		const accelMag = Math.sqrt((vx - prevVx) * (vx - prevVx) + (vz - prevVz) * (vz - prevVz)) / Math.max(dt, 1e-6);
+		const drainPerSec = ENERGY_DRAIN_BASE_PER_SEC + ENERGY_DRAIN_SPEED_PER_UNIT * speed + ENERGY_DRAIN_ACCEL_PER_UNIT * accelMag;
+		let energy = clamp(agent.energy - drainPerSec * dt, 0, MAX_ENERGY);
+		let alive = energy > 0;
+		if (!alive) {
+			vx = 0;
+			vz = 0;
+		}
+
+		let headingX = agent.headingX;
+		let headingZ = agent.headingZ;
+		const vmag = Math.sqrt(vx * vx + vz * vz);
+		if (vmag > 0.02) {
+			headingX = vx / vmag;
+			headingZ = vz / vmag;
+		}
+
+		let collisions = agent.collisions + (collidedThisStep ? 1 : 0);
 
 		let foodsEaten = agent.foodsEaten;
 		let firstFoodTime = agent.firstFoodTime;
@@ -532,6 +736,8 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 			if (dist({ x, z }, prev.foods[i]) < FOOD_RADIUS + AGENT_RADIUS) {
 				eatenMask[i] = true;
 				foodsEaten += 1;
+				energy = clamp(energy + ENERGY_GAIN_PER_FOOD, 0, MAX_ENERGY);
+				alive = energy > 0;
 				if (firstFoodTime == null) firstFoodTime = elapsed;
 			}
 		}
@@ -544,7 +750,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 
 		const learningEnabled = settings.learningEnabled ?? false;
 		const learningRate = settings.learningRate ?? 0;
-		const nextGenome = learningEnabled && learningRate > 0 ? learnGenome(agent.genome, inputs, hidden, out, reward, learningRate) : agent.genome;
+		const nextGenome = learningEnabled && learningRate > 0 ? learnGenome(agent.genome, inputs, hiddenLayers, out, reward, learningRate) : agent.genome;
 
 		const nextAgent: Agent = {
 			...agent,
@@ -552,6 +758,10 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 			z,
 			vx,
 			vz,
+			headingX,
+			headingZ,
+			energy,
+			alive,
 			collisions,
 			foodsEaten,
 			firstFoodTime,
@@ -561,7 +771,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 			genome: nextGenome,
 			brain: {
 				inputs,
-				hidden,
+				hidden: hiddenLayers,
 				outputs: out,
 			},
 		};
@@ -595,10 +805,12 @@ function hslToColor3(h: number, s: number, l: number): BABYLON.Color3 {
 
 function BabylonWorld({
 	state,
+	visionRadius,
 	selectedAgentId,
 	onSelectAgent,
 }: {
 	state: SimState;
+	visionRadius: number;
 	selectedAgentId: string | null;
 	onSelectAgent: (id: string) => void;
 }) {
@@ -606,6 +818,7 @@ function BabylonWorld({
 	const stateRef = useRef(state);
 	const selectedIdRef = useRef<string | null>(selectedAgentId);
 	const onSelectAgentRef = useRef(onSelectAgent);
+	const visionRadiusRef = useRef<number>(visionRadius);
 
 	useEffect(() => {
 		stateRef.current = state;
@@ -618,6 +831,10 @@ function BabylonWorld({
 	useEffect(() => {
 		onSelectAgentRef.current = onSelectAgent;
 	}, [onSelectAgent]);
+
+	useEffect(() => {
+		visionRadiusRef.current = visionRadius;
+	}, [visionRadius]);
 
 	const createAgentTriangle = (name: string, scene: BABYLON.Scene) => {
 		// A small triangular prism pointing along +Z.
@@ -709,17 +926,25 @@ function BabylonWorld({
 		// Vision ring shown around the currently selected agent.
 		const visionRing = BABYLON.MeshBuilder.CreateTorus(
 			"vision-ring",
-			{ diameter: VISION_RADIUS * 2, thickness: 0.05, tessellation: 64 },
+			{ diameter: DEFAULT_VISION_RADIUS * 2, thickness: 0.05, tessellation: 64 },
 			scene,
 		);
 		visionRing.isPickable = false;
-		visionRing.position.y = 0.06;
+		visionRing.position.y = 0.09;
+		visionRing.renderingGroupId = 1;
 		const ringMat = new BABYLON.StandardMaterial("visionRingMat", scene);
 		ringMat.emissiveColor = BABYLON.Color3.FromHexString("#38bdf8");
 		ringMat.diffuseColor = BABYLON.Color3.FromHexString("#0ea5e9");
 		ringMat.alpha = 0.55;
 		visionRing.material = ringMat;
 		visionRing.setEnabled(false);
+
+		// 120° viewing segment around the selected creature (thick tube so it's visible).
+		let fovTube: BABYLON.Mesh | null = null;
+		const fovTubeMat = new BABYLON.StandardMaterial("fovTubeMat", scene);
+		fovTubeMat.emissiveColor = BABYLON.Color3.FromHexString("#a78bfa");
+		fovTubeMat.diffuseColor = BABYLON.Color3.FromHexString("#7c3aed");
+		fovTubeMat.alpha = 0.85;
 
 		const obstacleMat = new BABYLON.StandardMaterial("obstacleMat", scene);
 		obstacleMat.diffuseColor = BABYLON.Color3.FromHexString("#64748b");
@@ -784,38 +1009,93 @@ function BabylonWorld({
 					agentMeshes.set(a.id, mesh);
 				}
 
-				const speed = Math.sqrt(a.vx * a.vx + a.vz * a.vz);
-				if (speed > 0.02) {
-					const yaw = Math.atan2(a.vx, a.vz);
-					mesh.rotation.set(0, yaw, 0);
-				}
+				// Face the persistent heading (stable even at low speed).
+				const yaw = Math.atan2(a.headingX, a.headingZ);
+				mesh.rotation.set(0, yaw, 0);
 				mesh.position.set(a.x, 0.06, a.z);
 
 				const isBest = best?.id === a.id;
 				const hue = clamp(120 - a.foodsEaten * 16 - a.collisions * 0.6, 0, 120);
-				const color = isBest ? BABYLON.Color3.FromHexString("#22d3ee") : hslToColor3(hue, 82, 48);
+				const aliveColor = isBest ? BABYLON.Color3.FromHexString("#22d3ee") : hslToColor3(hue, 82, 48);
+				const color = a.alive ? aliveColor : BABYLON.Color3.FromHexString("#334155");
 				let mat = mesh.material as BABYLON.StandardMaterial | null;
 				if (!mat) {
 					mat = new BABYLON.StandardMaterial(`agent-mat-${a.id}`, scene);
 					mesh.material = mat;
 				}
 				mat.diffuseColor = color;
+				mat.alpha = a.alive ? 1 : 0.55;
 			}
 
 			// Update vision ring around selected creature.
 			const selectedId = selectedIdRef.current;
 			if (!selectedId) {
 				visionRing.setEnabled(false);
+				if (fovTube) fovTube.setEnabled(false);
 				return;
 			}
 			const selected = agents.find((a) => a.id === selectedId);
 			if (!selected) {
 				visionRing.setEnabled(false);
+				if (fovTube) fovTube.setEnabled(false);
 				return;
 			}
 			visionRing.setEnabled(true);
+			const r = Math.max(0.1, visionRadiusRef.current);
+			const scale = r / DEFAULT_VISION_RADIUS;
+			visionRing.scaling.set(scale, 1, scale);
 			visionRing.position.x = selected.x;
 			visionRing.position.z = selected.z;
+
+			// 120° viewing segment path in world space.
+			const cx = selected.x;
+			const cz = selected.z;
+			const cy = 0.14;
+			const hx = selected.headingX;
+			const hz = selected.headingZ;
+			const angleLeft = -VISION_HALF_FOV_RAD;
+			const angleRight = VISION_HALF_FOV_RAD;
+			const segs = 28;
+			const path: BABYLON.Vector3[] = [];
+			const center = new BABYLON.Vector3(cx, cy, cz);
+
+			const rotate2 = (x: number, z: number, ang: number) => {
+				const c = Math.cos(ang);
+				const s = Math.sin(ang);
+				return { x: x * c - z * s, z: x * s + z * c };
+			};
+
+			const leftDir = rotate2(hx, hz, angleLeft);
+			const rightDir = rotate2(hx, hz, angleRight);
+			const pLeft = new BABYLON.Vector3(cx + leftDir.x * r, cy, cz + leftDir.z * r);
+			const pRight = new BABYLON.Vector3(cx + rightDir.x * r, cy, cz + rightDir.z * r);
+
+			// center -> left
+			path.push(center, pLeft);
+			// arc from left to right
+			for (let i = 0; i <= segs; i += 1) {
+				const t = i / segs;
+				const ang = angleLeft + (angleRight - angleLeft) * t;
+				const d = rotate2(hx, hz, ang);
+				path.push(new BABYLON.Vector3(cx + d.x * r, cy, cz + d.z * r));
+			}
+			// right -> center
+			path.push(pRight, center);
+
+			if (!fovTube) {
+				fovTube = BABYLON.MeshBuilder.CreateTube(
+					"fov-tube",
+					{ path, radius: 0.06, tessellation: 12, cap: BABYLON.Mesh.CAP_ALL, updatable: true },
+					scene,
+				);
+				fovTube.isPickable = false;
+				fovTube.material = fovTubeMat;
+				fovTube.renderingGroupId = 1;
+				fovTube.setEnabled(true);
+			} else {
+				BABYLON.MeshBuilder.CreateTube("fov-tube", { path, instance: fovTube });
+				fovTube.setEnabled(true);
+			}
 		};
 
 		scene.onPointerObservable.add((eventInfo) => {
@@ -861,6 +1141,7 @@ export default function NeuralVisionSim3D() {
 		learningRate: 0.03,
 	});
 	const [paused, setPaused] = useState(false);
+	const [visionRadius, setVisionRadius] = useState<number>(DEFAULT_VISION_RADIUS);
 	const [state, setState] = useState<SimState>(() => createInitialState(settings));
 	const startPos = useMemo(() => ({ x: -HALF + 8, z: -HALF + 8 }), []);
 
@@ -873,7 +1154,7 @@ export default function NeuralVisionSim3D() {
 			last = now;
 
 			if (!paused) {
-				setState((prev) => stepSimulation(prev, dt, settings, startPos));
+				setState((prev) => stepSimulation(prev, dt, settings, startPos, visionRadius));
 			}
 
 			raf = window.requestAnimationFrame(tick);
@@ -881,7 +1162,7 @@ export default function NeuralVisionSim3D() {
 
 		raf = window.requestAnimationFrame(tick);
 		return () => window.cancelAnimationFrame(raf);
-	}, [paused, settings, startPos]);
+	}, [paused, settings, startPos, visionRadius]);
 
 	const bestCurrent = useMemo(() => {
 		return [...state.agents].sort((a, b) => b.fitness - a.fitness)[0] ?? null;
@@ -921,7 +1202,7 @@ export default function NeuralVisionSim3D() {
 
 	return (
 		<>
-			<BabylonWorld state={state} selectedAgentId={selectedAgentId} onSelectAgent={setSelectedAgentId} />
+			<BabylonWorld state={state} visionRadius={visionRadius} selectedAgentId={selectedAgentId} onSelectAgent={setSelectedAgentId} />
 			<aside className="controls-panel">
 				<Card className="bg-transparent border-0 shadow-none">
 					<div className="controls-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -939,15 +1220,20 @@ export default function NeuralVisionSim3D() {
 								<div>Generation: <strong>{state.generation}</strong></div>
 								<div>Timer: <strong>{state.elapsedSeconds.toFixed(1)}s / 300s</strong></div>
 								<div>Population: <strong>{state.agents.length}</strong></div>
-								<div>Vision Radius: <strong>{VISION_RADIUS} units</strong></div>
+								<div>Vision Radius: <strong>{visionRadius.toFixed(1)} units</strong></div>
 								<div>Best (current): <strong>{bestCurrent ? bestCurrent.fitness.toFixed(1) : "0.0"}</strong></div>
 								<div>Best (prev gen): <strong>{state.bestLastGeneration.toFixed(1)}</strong></div>
 								<div>Best (ever): <strong>{state.bestEverFitness.toFixed(1)}</strong></div>
 								<div>Best eaten: <strong>{bestCurrent?.foodsEaten ?? 0}</strong></div>
+								<div>Best hidden layers: <strong>{bestCurrent?.genome.hiddenLayers ?? 0}</strong></div>
 								<div>Best hidden neurons: <strong>{bestCurrent?.genome.hiddenSize ?? 0}</strong></div>
 							</div>
 
 							<div className="space-y-3">
+								<div>
+									<div className="flex justify-between text-sm mb-1"><span>Vision Radius</span><span>{visionRadius.toFixed(1)}</span></div>
+									<Slider value={[visionRadius]} min={1} max={16} step={0.5} onValueChange={(v: number[]) => setVisionRadius(v[0])} />
+								</div>
 								<div>
 									<div className="flex justify-between text-sm mb-1"><span>Learning</span><span>{settings.learningEnabled ? "On" : "Off"}</span></div>
 									<label className="flex items-center justify-between rounded-xl border border-slate-700 p-3 text-sm">
@@ -1004,7 +1290,8 @@ export default function NeuralVisionSim3D() {
 								</select>
 								{selectedAgent && (
 									<>
-										<div className="text-xs text-slate-300">Hidden neurons: {selectedAgent.genome.hiddenSize}</div>
+										<div className="text-xs text-slate-300">Hidden layers: {selectedAgent.genome.hiddenLayers} · neurons/layer: {selectedAgent.genome.hiddenSize}</div>
+										<div className="text-xs text-slate-300">Energy: {selectedAgent.energy.toFixed(1)} / {MAX_ENERGY} · {selectedAgent.alive ? "Alive" : "Dead"}</div>
 										<NeuralNetGraph genome={selectedAgent.genome} />
 										{/* <div className="text-xs text-slate-300">DNA (genome)</div>
 										<pre className="max-h-[220px] overflow-auto rounded-lg border border-slate-700 bg-slate-950/40 p-2 text-[11px] leading-snug text-slate-200">
@@ -1015,7 +1302,7 @@ export default function NeuralVisionSim3D() {
 							</div>
 
 							<div className="rounded-xl border border-slate-700 p-3 text-xs text-slate-300 leading-relaxed">
-								Each agent sees only within 5 units. A tiny neural net converts local food/obstacle signals into movement. DNA includes weights, biases, neuron count, and connection masks, all inherited and mutated each generation.
+								Each agent sees only within {visionRadius.toFixed(1)} units. A tiny neural net converts local food/obstacle signals into movement. DNA includes weights, biases, neuron count, and connection masks, all inherited and mutated each generation.
 							</div>
 						</CardContent>
 					)}
@@ -1031,12 +1318,12 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 	const height = 180;
 	const padY = 14;
 	const inputX = 18;
-	const hiddenX = 150;
 	const outputX = 282;
+	const hiddenXs = Array.from({ length: genome.hiddenLayers }, (_, l) => inputX + ((l + 1) * (outputX - inputX)) / (genome.hiddenLayers + 1));
 
 	const inputYs = Array.from({ length: INPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, INPUTS - 1));
 	const hiddenYs = Array.from({ length: genome.hiddenSize }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, genome.hiddenSize - 1));
-	const outputYs = [height * 0.4, height * 0.6];
+	const outputYs = Array.from({ length: OUTPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, OUTPUTS - 1));
 
 	const strokeForWeight = (w: number) => {
 		const abs = Math.min(1, Math.abs(w) / 2);
@@ -1047,7 +1334,7 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 
 	return (
 		<svg width={width} height={height} className="w-full rounded-lg border border-slate-700 bg-slate-950/40">
-			{/* Input -> Hidden connections */}
+			{/* Input -> Hidden[0] connections */}
 			{Array.from({ length: INPUTS }, (_, i) =>
 				Array.from({ length: genome.hiddenSize }, (_, h) => {
 					if (genome.inputHiddenMask[i][h] <= 0.5) return null;
@@ -1058,7 +1345,7 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 							key={`ih-${i}-${h}`}
 							x1={inputX}
 							y1={inputYs[i]}
-							x2={hiddenX}
+							x2={hiddenXs[0] ?? inputX}
 							y2={hiddenYs[h]}
 							stroke={s.color}
 							strokeWidth={s.width}
@@ -1068,7 +1355,30 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 				}),
 			)}
 
-			{/* Hidden -> Output connections */}
+			{/* Hidden[l-1] -> Hidden[l] connections */}
+			{Array.from({ length: Math.max(0, genome.hiddenLayers - 1) }, (_, l) =>
+				Array.from({ length: genome.hiddenSize }, (_, i) =>
+					Array.from({ length: genome.hiddenSize }, (_, h) => {
+						if ((genome.hiddenHiddenMask[l]?.[i]?.[h] ?? 0) <= 0.5) return null;
+						const w = genome.hiddenHiddenWeights[l]?.[i]?.[h] ?? 0;
+						const s = strokeForWeight(w);
+						return (
+							<line
+								key={`hh-${l}-${i}-${h}`}
+								x1={hiddenXs[l] ?? inputX}
+								y1={hiddenYs[i]}
+								x2={hiddenXs[l + 1] ?? outputX}
+								y2={hiddenYs[h]}
+								stroke={s.color}
+								strokeWidth={s.width}
+								opacity={s.opacity * 0.9}
+							/>
+						);
+					}),
+				),
+			)}
+
+			{/* Hidden[last] -> Output connections */}
 			{Array.from({ length: genome.hiddenSize }, (_, h) =>
 				Array.from({ length: OUTPUTS }, (_, o) => {
 					if (genome.hiddenOutputMask[h][o] <= 0.5) return null;
@@ -1077,7 +1387,7 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 					return (
 						<line
 							key={`ho-${h}-${o}`}
-							x1={hiddenX}
+							x1={hiddenXs[genome.hiddenLayers - 1] ?? inputX}
 							y1={hiddenYs[h]}
 							x2={outputX}
 							y2={outputYs[o]}
@@ -1093,9 +1403,9 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 			{inputYs.map((y, i) => (
 				<circle key={`in-${i}`} cx={inputX} cy={y} r={4} fill="#94a3b8" />
 			))}
-			{hiddenYs.map((y, h) => (
-				<circle key={`h-${h}`} cx={hiddenX} cy={y} r={4} fill="#e2e8f0" />
-			))}
+			{hiddenXs.map((x, l) =>
+				hiddenYs.map((y, h) => <circle key={`h-${l}-${h}`} cx={x} cy={y} r={4} fill="#e2e8f0" />),
+			)}
 			{outputYs.map((y, o) => (
 				<circle key={`out-${o}`} cx={outputX} cy={y} r={5} fill="#facc15" />
 			))}

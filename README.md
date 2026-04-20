@@ -1,16 +1,15 @@
-# React + Vite
+# survival-sim
 
-This template provides a minimal setup to get React working in Vite with HMR and some ESLint rules.
+A React + Vite simulation hub with three BabylonJS-based simulations.
 
-Currently, two official plugins are available:
+## Run
 
-- [@vitejs/plugin-react](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react) uses [Oxc](https://oxc.rs)
-- [@vitejs/plugin-react-swc](https://github.com/vitejs/vite-plugin-react/blob/main/packages/plugin-react-swc) uses [SWC](https://swc.rs/)
+- Install: `npm install`
+- Dev: `npm run dev`
+- Build: `npm run build`
 
-## React Compiler
+## Simulations
 
-The React Compiler is not enabled on this template because of its impact on dev & build performances. To add it, see [this documentation](https://react.dev/learn/react-compiler/installation).
-
-## Expanding the ESLint configuration
-
-If you are developing a production application, we recommend using TypeScript with type-aware lint rules enabled. Check out the [TS template](https://github.com/vitejs/vite/tree/main/packages/create-vite/template-react-ts) for information on how to integrate TypeScript and [`typescript-eslint`](https://typescript-eslint.io) in your project.
+- Sim 1 (Survival Sandbox): [docs/sim1-survival-sandbox.md](docs/sim1-survival-sandbox.md)
+- Sim 2 (Genetic Triangles GA): [docs/sim2-genetic-triangles.md](docs/sim2-genetic-triangles.md)
+- Sim 3 (Neural Vision GA): [docs/sim3-neural-vision-ga.md](docs/sim3-neural-vision-ga.md)
