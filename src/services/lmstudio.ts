@@ -124,25 +124,82 @@ export async function lmStudioChatText(req: LmStudioChatRequest): Promise<string
 	const max_output_tokens = req.maxOutputTokens ?? 140;
 	const temperature = req.temperature ?? 0;
 
-	const input: any = req.visionDataUrl
+	// LM Studio REST payload format can vary by server/version.
+	// This server variant expects discriminated items: {type:"text", content:"..."} and {type:"image", data_url:"..."}.
+	// We try the discriminated multimodal shape first to ensure images are actually sent.
+	const inputDiscriminated: any = req.visionDataUrl
 		? [
-				{ type: "text", text: req.userText },
+				{ type: "text", content: req.userText },
 				{ type: "image", data_url: req.visionDataUrl },
 			]
-		: [{ type: "text", text: req.userText }];
+		: [{ type: "text", content: req.userText }];
 
-	const res = await fetch(`${baseUrl}/api/v1/chat`, {
-		method: "POST",
-		headers: { "content-type": "application/json" },
-		body: JSON.stringify({
-			model: modelKey,
-			system_prompt: req.systemPrompt,
-			input,
-			temperature,
-			max_output_tokens,
-			store: false,
-		}),
-	});
+	// Older/alternate variants may accept "message objects" with content + images.
+	const inputMessages: any = req.visionDataUrl
+		? [{ role: "user", content: req.userText, images: [req.visionDataUrl] }]
+		: [{ role: "user", content: req.userText }];
+
+	const doChat = async (input: any, includeReasoningOff: boolean) => {
+		return await fetch(`${baseUrl}/api/v1/chat`, {
+			method: "POST",
+			headers: { "content-type": "application/json" },
+			body: JSON.stringify({
+				model: modelKey,
+				system_prompt: req.systemPrompt,
+				input,
+				temperature,
+				max_output_tokens,
+				...(includeReasoningOff ? { reasoning: "off" } : {}),
+				store: false,
+			}),
+		});
+	};
+
+	let res = await doChat(inputDiscriminated, true);
+	let errText = "";
+	if (!res.ok) {
+		try {
+			errText = await res.text();
+		} catch {
+			errText = "";
+		}
+
+		// If server rejects the `reasoning` field, retry without it.
+		const reasoningKeyRejected = /unrecognized key\(s\) in object:\s*'reasoning'/i.test(errText);
+		if (reasoningKeyRejected) {
+			res = await doChat(inputDiscriminated, false);
+			if (!res.ok) {
+				try {
+					errText = await res.text();
+				} catch {
+					errText = "";
+				}
+			} else {
+				errText = "";
+			}
+		}
+
+		// If server doesn't accept discriminated items, try message-object variant.
+		const expectsMessagesShape = /input\.?0\.?content/i.test(errText) || /unrecognized key\(s\) in object:\s*'text'/i.test(errText);
+		const expectsDiscriminated =
+			/invalid discriminator value/i.test(errText) ||
+			/expected\s*["']text["']\s*\|\s*["']image["']/i.test(errText) ||
+			/unrecognized key\(s\) in object:\s*'content'/i.test(errText);
+		if (expectsMessagesShape) {
+			res = await doChat(inputMessages, false);
+			if (!res.ok) {
+				try {
+					errText = await res.text();
+				} catch {
+					errText = "";
+				}
+			} else {
+				errText = "";
+			}
+		} else if (expectsDiscriminated) {
+			// Already tried discriminated; keep errText for OpenAI fallback below.
+		}
+	}
 
 	if (res.ok) {
 		const json = await res.json();
@@ -150,18 +207,24 @@ export async function lmStudioChatText(req: LmStudioChatRequest): Promise<string
 		const messages = outItems
 			.filter((it) => it?.type === "message" && typeof it?.content === "string")
 			.map((it) => String(it.content));
-		return messages.length ? messages[messages.length - 1] : "";
+		if (messages.length) return messages[messages.length - 1];
+
+		const reasoning = outItems
+			.filter((it) => it?.type === "reasoning" && typeof it?.content === "string")
+			.map((it) => String(it.content));
+		return reasoning.length ? reasoning[reasoning.length - 1] : "";
 	}
 
-	let errText = "";
-	try {
-		errText = await res.text();
-	} catch {
-		errText = "";
+	if (!errText) {
+		try {
+			errText = await res.text();
+		} catch {
+			errText = "";
+		}
 	}
 
 	const shouldTryOpenAi = /messages\s*field\s*is\s*required/i.test(errText) || res.status === 404 || res.status === 405;
-	if (!shouldTryOpenAi) throw new Error(`LM Studio chat HTTP ${res.status}`);
+	if (!shouldTryOpenAi) throw new Error(`LM Studio chat HTTP ${res.status}: ${errText}`);
 
 	const userContent: any = req.visionDataUrl
 		? [

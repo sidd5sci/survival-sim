@@ -124,6 +124,10 @@ type AiAction = {
 	grow?: boolean;
 };
 
+function round3(v: number): number {
+	return Math.round(v * 1000) / 1000;
+}
+
 function extractJsonObject(text: string): any {
 	// Try fenced ```json blocks first
 	const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
@@ -179,40 +183,25 @@ function defaultFallbackAction(bot: Bot): AiAction {
 		grow: bot.energy < bot.maxEnergy * 0.25,
 	};
 }
-async function callLocalAi(lmStudioBaseUrl: string, model: string, payload: any, visionDataUrl?: string | null): Promise<AiAction> {
+async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState: any, visionDataUrl?: string | null): Promise<AiAction> {
 	const modelKey = model.trim();
 	if (!modelKey) throw new Error("Missing model key");
 
-	const toolSpec = {
-		controls: {
-			left: "strafe left intensity in [-1..1]",
-			right: "strafe right intensity in [-1..1]",
-			forward: "move forward intensity in [-1..1]",
-			backward: "move backward intensity in [-1..1]",
-			speed: "desired speed fraction in [0..1]",
-		},
-		actions: {
-			pick: "pick up nearest rock (if within ~2.2 units and hands free)",
-			throw: "throw held rock forward (costs energy)",
-			grow: "grow an organ if energy is sufficient (increases maxEnergy/maxHealth)",
-		},
-		goal: "survive and reach the green exit ring; avoid enemies; use rocks if needed",
-	};
-
 	const systemPrompt =
-		"You are controlling a bot in a 3D city survival simulation. Behave like a careful human trying to survive: avoid enemies, use cover, pick/throw rocks if helpful, and head toward the green exit ring when safe.\n\n" +
-		"You will receive an image of what the bot sees (its eye camera) plus a compact state JSON.\n" +
-		"Reply ONLY with a single JSON object matching this schema: {left,right,forward,backward,speed,pick?,throw?,grow?}." +
-		" No markdown, no explanations, no extra keys.";
+		"Return ONLY one minified JSON object. No reasoning. No prose. No markdown.\n" +
+		"Keys: left,right,forward,backward in [-1..1], speed in [0..1], optional booleans pick,throw,grow.\n" +
+		"Actions: pick picks nearest rock if close and hands free; throw throws held rock forward; grow increases capacity if enough energy.\n" +
+		"Goal: survive, avoid enemies, reach the green exit ring.\n" +
+		"Example: {\"left\":0,\"right\":0,\"forward\":1,\"backward\":0,\"speed\":0.8}";
 
-	const userText = JSON.stringify({ ...payload, tools: toolSpec });
+	const userText = JSON.stringify(compactState);
 	const content = await lmStudioChatText({
 		lmStudioBaseUrl,
 		model: modelKey,
 		systemPrompt,
 		userText,
 		visionDataUrl: visionDataUrl ?? null,
-		maxOutputTokens: 140,
+		maxOutputTokens: 90,
 		temperature: 0,
 	});
 
@@ -515,30 +504,80 @@ function BabylonWorld({
 				flipped.set(pixels.subarray(srcRow, srcRow + res * 4), dstRow);
 			}
 
-			// Build grayscale matrix (0..1)
-			const matrix: number[][] = [];
-			for (let y = 0; y < res; y += 1) {
-				const row: number[] = [];
-				for (let x = 0; x < res; x += 1) {
-					const idx = (y * res + x) * 4;
-					const r = flipped[idx] ?? 0;
-					const g = flipped[idx + 1] ?? 0;
-					const b = flipped[idx + 2] ?? 0;
-					row.push((0.2126 * r + 0.7152 * g + 0.0722 * b) / 255);
-				}
-				matrix.push(row);
-			}
-
 			// Create a preview data URL.
 			const offscreen = document.createElement("canvas");
 			offscreen.width = res;
 			offscreen.height = res;
 			const ctx = offscreen.getContext("2d", { willReadFrequently: true });
-			if (!ctx) return { matrix, dataUrl: "" };
+			if (!ctx) return { dataUrl: "" };
 			const img = new ImageData(flipped, res, res);
 			ctx.putImageData(img, 0, 0);
 			const dataUrl = offscreen.toDataURL("image/png");
-			return { matrix, dataUrl };
+			return { dataUrl };
+		};
+
+		const computeCompactState = () => {
+			const basis = computeBotHeadingBasis();
+			const toExitX = EXIT_X - bot.x;
+			const toExitZ = EXIT_Z - bot.z;
+			const exitDist = Math.sqrt(toExitX * toExitX + toExitZ * toExitZ);
+			const toExitDir = normalize(toExitX, toExitZ);
+			const exitForward = toExitDir.x * basis.h.x + toExitDir.z * basis.h.z;
+			const exitRight = toExitDir.x * basis.r.x + toExitDir.z * basis.r.z;
+
+			let nearestEnemyDist = Infinity;
+			let nearestEnemyForward = 0;
+			let nearestEnemyRight = 0;
+			for (const e of enemies) {
+				if (!e.alive) continue;
+				const dx = e.x - bot.x;
+				const dz = e.z - bot.z;
+				const d = Math.sqrt(dx * dx + dz * dz);
+				if (d < nearestEnemyDist) {
+					nearestEnemyDist = d;
+					const dir = normalize(dx, dz);
+					nearestEnemyForward = dir.x * basis.h.x + dir.z * basis.h.z;
+					nearestEnemyRight = dir.x * basis.r.x + dir.z * basis.r.z;
+				}
+			}
+
+			let nearestRockDist = Infinity;
+			let nearestRockForward = 0;
+			let nearestRockRight = 0;
+			for (const r of rocks) {
+				if (!r.active || r.heldByBot) continue;
+				const dx = r.x - bot.x;
+				const dz = r.z - bot.z;
+				const d = Math.sqrt(dx * dx + dz * dz);
+				if (d < nearestRockDist) {
+					nearestRockDist = d;
+					const dir = normalize(dx, dz);
+					nearestRockForward = dir.x * basis.h.x + dir.z * basis.h.z;
+					nearestRockRight = dir.x * basis.r.x + dir.z * basis.r.z;
+				}
+			}
+
+			const heldRock = rocks.some((r) => r.active && r.heldByBot);
+			const botSpeed = Math.sqrt(bot.vx * bot.vx + bot.vz * bot.vz);
+			const underThreat = Number.isFinite(nearestEnemyDist) && nearestEnemyDist < 4.2;
+
+			return {
+				health: round3(bot.health),
+				energy: round3(bot.energy),
+				organs: bot.organs,
+				botSpeed: round3(botSpeed),
+				exitDist: round3(exitDist),
+				exitForward: round3(exitForward),
+				exitRight: round3(exitRight),
+				nearestEnemyDist: Number.isFinite(nearestEnemyDist) ? round3(nearestEnemyDist) : null,
+				nearestEnemyForward: Number.isFinite(nearestEnemyDist) ? round3(nearestEnemyForward) : null,
+				nearestEnemyRight: Number.isFinite(nearestEnemyDist) ? round3(nearestEnemyRight) : null,
+				nearestRockDist: Number.isFinite(nearestRockDist) ? round3(nearestRockDist) : null,
+				nearestRockForward: Number.isFinite(nearestRockDist) ? round3(nearestRockForward) : null,
+				nearestRockRight: Number.isFinite(nearestRockDist) ? round3(nearestRockRight) : null,
+				heldRock,
+				underThreat,
+			};
 		};
 
 		const computeBotHeadingBasis = () => {
@@ -681,16 +720,8 @@ function BabylonWorld({
 					(void (async () => {
 						try {
 							const cap = await captureVision(Math.round(clamp(s.visionResolution, 16, 96)));
-							const vision = cap?.matrix ?? null;
 							if (cap?.dataUrl) onVisionPreviewRef.current(cap.dataUrl);
-							const payload = {
-								model: s.aiModel,
-								vision,
-								state: {
-									bot: { x: bot.x, z: bot.z, vx: bot.vx, vz: bot.vz, health: bot.health, energy: bot.energy, organs: bot.organs },
-									enemiesAlive: enemies.filter((e) => e.alive).length,
-								},
-							};
+							const compactState = computeCompactState();
 
 							let action: AiAction;
 							if (s.aiProvider === "local" && s.localEndpointUrl.trim()) {
@@ -700,12 +731,12 @@ function BabylonWorld({
 									action = await callLocalAi(
 										s.localEndpointUrl.trim(),
 										s.localModelName.trim() || "google/gemma-4-e2b",
-									payload,
+									compactState,
 									cap?.dataUrl ?? null,
 								);
 								}
 							} else if (s.aiProvider === "replicate" && s.replicateApiToken.trim() && s.replicateModel.trim()) {
-								action = await callReplicateLike(s.replicateApiToken.trim(), s.replicateModel.trim(), payload);
+								action = await callReplicateLike(s.replicateApiToken.trim(), s.replicateModel.trim(), compactState);
 							} else {
 								action = defaultFallbackAction(bot);
 							}
@@ -963,10 +994,11 @@ function BabylonWorld({
 }
 
 export default function CityEscapeSim3D() {
+	const defaultLocalUrl = import.meta.env.DEV ? "/lmstudio" : "http://127.0.0.1:1234";
 	const [settings, setSettings] = useState<Sim4Settings>({
 		aiProvider: "local",
 		aiModel: "gemma-4",
-		localEndpointUrl: "/lmstudio",
+		localEndpointUrl: defaultLocalUrl,
 		localModelName: "google/gemma-4-e2b",
 		replicateApiToken: "",
 		replicateModel: "",
