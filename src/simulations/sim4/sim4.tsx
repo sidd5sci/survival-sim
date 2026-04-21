@@ -2238,15 +2238,17 @@ function NeuralNetGraph({
 	};
 }) {
 	const width = 300;
-	const height = 180;
+	const graphHeight = 180;
+	const legendHeight = 14;
+	const height = graphHeight + legendHeight;
 	const padY = 14;
 	const inputX = 18;
 	const outputX = 282;
 	const hiddenXs = Array.from({ length: genome.hiddenLayers }, (_, l) => inputX + ((l + 1) * (outputX - inputX)) / (genome.hiddenLayers + 1));
 
-	const inputYs = Array.from({ length: INPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, INPUTS - 1));
-	const hiddenYs = Array.from({ length: genome.hiddenSize }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, genome.hiddenSize - 1));
-	const outputYs = Array.from({ length: OUTPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, OUTPUTS - 1));
+	const inputYs = Array.from({ length: INPUTS }, (_, i) => padY + (i * (graphHeight - 2 * padY)) / Math.max(1, INPUTS - 1));
+	const hiddenYs = Array.from({ length: genome.hiddenSize }, (_, i) => padY + (i * (graphHeight - 2 * padY)) / Math.max(1, genome.hiddenSize - 1));
+	const outputYs = Array.from({ length: OUTPUTS }, (_, i) => padY + (i * (graphHeight - 2 * padY)) / Math.max(1, OUTPUTS - 1));
 
 	const inputLabels = ["Fx", "Fz", "Fd", "Ox", "Oz", "Od", "Vx", "Vz", "En", "Fit"];
 	const outputLabels = ["L", "R", "F", "S"];
@@ -2276,6 +2278,14 @@ function NeuralNetGraph({
 
 	return (
 		<svg width={width} height={height} className="w-full rounded-lg border border-slate-700 bg-slate-950/40">
+			<defs>
+				<linearGradient id="actScale" x1="0" y1="0" x2="1" y2="0">
+					<stop offset="0%" stopColor="#fb7185" />
+					<stop offset="50%" stopColor="#94a3b8" />
+					<stop offset="100%" stopColor="#38bdf8" />
+				</linearGradient>
+			</defs>
+
 			{/* Input -> Hidden[0] connections */}
 			{Array.from({ length: INPUTS }, (_, i) =>
 				Array.from({ length: genome.hiddenSize }, (_, h) => {
@@ -2406,6 +2416,43 @@ function NeuralNetGraph({
 					</text>
 				</g>
 			))}
+
+			{/* Activation scale bar (red -> gray -> blue) */}
+			<rect
+				x={16}
+				y={graphHeight + 5}
+				width={width - 32}
+				height={6}
+				rx={3}
+				fill="url(#actScale)"
+				opacity={0.95}
+				stroke="#334155"
+				strokeOpacity={0.7}
+			/>
+			<text
+				x={16}
+				y={graphHeight + 4}
+				textAnchor="start"
+				fontSize={9}
+				fontWeight={700}
+				fill="#e2e8f0"
+				opacity={0.9}
+				style={{ userSelect: "none" }}
+			>
+				Low activation
+			</text>
+			<text
+				x={width - 16}
+				y={graphHeight + 4}
+				textAnchor="end"
+				fontSize={9}
+				fontWeight={700}
+				fill="#e2e8f0"
+				opacity={0.9}
+				style={{ userSelect: "none" }}
+			>
+				High activation
+			</text>
 		</svg>
 	);
 }
