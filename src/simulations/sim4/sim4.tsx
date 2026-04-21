@@ -186,26 +186,46 @@ function isSavedSim3GenomesV1(v: any): v is SavedSim3GenomesV1 {
 }
 
 function createMazeWorld(): { obstacles: Obstacle[]; openCells: Vec2[] } {
-	// Generate a maze and also return safe open cell-centers so we can place fruits in reachable locations.
-	const start = { x: -HALF + 8, z: -HALF + 8 };
-	const min = -HALF + 8;
-	const max = HALF - 8;
-	const cellSize = 10;
-	const w = Math.max(2, Math.floor((max - min) / cellSize));
-	const h = Math.max(2, Math.floor((max - min) / cellSize));
-	const origin = min + cellSize / 2;
+	const padding = 0;
+	const min = -HALF + padding;
+	const max = HALF - padding;
+	const usableSize = max - min;
 
-	type Cell = { v: boolean; n: boolean; e: boolean; s: boolean; w: boolean };
-	const cells: Cell[][] = Array.from({ length: h }, () =>
-		Array.from({ length: w }, () => ({ v: false, n: true, e: true, s: true, w: true })),
+	// Choose maze density first, then fit tiles exactly into the world.
+	const desiredTileSize = 6;
+
+	let gridW = Math.floor(usableSize / desiredTileSize);
+	let gridH = Math.floor(usableSize / desiredTileSize);
+
+	gridW = Math.max(5, gridW);
+	gridH = Math.max(5, gridH);
+
+	// Force odd dimensions so DFS-on-odd-cells behaves well.
+	if (gridW % 2 === 0) gridW -= 1;
+	if (gridH % 2 === 0) gridH -= 1;
+
+	// IMPORTANT: fit exactly to bounds so no extra thick strip on top/right.
+	const tileSizeX = usableSize / gridW;
+	const tileSizeZ = usableSize / gridH;
+
+	const originX = min;
+	const originZ = min;
+
+	const start = { x: -HALF + 8, z: -HALF + 8 };
+
+	const grid: boolean[][] = Array.from({ length: gridH }, () =>
+		Array.from({ length: gridW }, () => true),
 	);
-	const inBounds = (cx: number, cz: number) => cx >= 0 && cx < w && cz >= 0 && cz < h;
+
+	const inBounds = (x: number, z: number) => x > 0 && x < gridW - 1 && z > 0 && z < gridH - 1;
+
 	const dirs = [
-		{ dx: 0, dz: -1, a: "n" as const, b: "s" as const },
-		{ dx: 1, dz: 0, a: "e" as const, b: "w" as const },
-		{ dx: 0, dz: 1, a: "s" as const, b: "n" as const },
-		{ dx: -1, dz: 0, a: "w" as const, b: "e" as const },
+		{ dx: 0, dz: -2 },
+		{ dx: 2, dz: 0 },
+		{ dx: 0, dz: 2 },
+		{ dx: -2, dz: 0 },
 	];
+
 	const shuffle = <T,>(arr: T[]) => {
 		for (let i = arr.length - 1; i > 0; i -= 1) {
 			const j = Math.floor(rand(0, i + 1));
@@ -214,63 +234,67 @@ function createMazeWorld(): { obstacles: Obstacle[]; openCells: Vec2[] } {
 		return arr;
 	};
 
-	// DFS carve (perfect maze => path exists between any two cells)
-	const stack: Array<{ x: number; z: number }> = [{ x: 0, z: 0 }];
-	cells[0][0].v = true;
+	const startGX = 1;
+	const startGZ = 1;
+
+	const stack: Array<{ x: number; z: number }> = [{ x: startGX, z: startGZ }];
+	grid[startGZ][startGX] = false;
+
 	while (stack.length) {
 		const cur = stack[stack.length - 1];
-		const opts = shuffle([...dirs]).filter((d) => {
+
+		const nextOptions = shuffle([...dirs]).filter((d) => {
 			const nx = cur.x + d.dx;
 			const nz = cur.z + d.dz;
-			return inBounds(nx, nz) && !cells[nz][nx].v;
+			return inBounds(nx, nz) && grid[nz][nx];
 		});
-		if (opts.length === 0) {
+
+		if (nextOptions.length === 0) {
 			stack.pop();
 			continue;
 		}
-		const d = opts[0];
+
+		const d = nextOptions[0];
 		const nx = cur.x + d.dx;
 		const nz = cur.z + d.dz;
-		cells[cur.z][cur.x][d.a] = false;
-		cells[nz][nx][d.b] = false;
-		cells[nz][nx].v = true;
+
+		grid[cur.z + d.dz / 2][cur.x + d.dx / 2] = false;
+		grid[nz][nx] = false;
+
 		stack.push({ x: nx, z: nz });
+	}
+
+	// Keep your entrance opening exactly as before.
+	if (gridH > startGZ && gridW > 0) {
+		grid[startGZ][0] = false;
+		grid[startGZ][startGX] = false;
 	}
 
 	const obstacles: Obstacle[] = [];
 	const openCells: Vec2[] = [];
-	const wallSize = 2.6;
+
 	const wallHeight = 3.2;
-	const addWallPair = (ax: number, az: number, bx: number, bz: number) => {
-		// Place two circles along the segment so the wall has fewer gaps.
-		const p1 = { x: ax + (bx - ax) * 0.25, z: az + (bz - az) * 0.25 };
-		const p2 = { x: ax + (bx - ax) * 0.75, z: az + (bz - az) * 0.75 };
-		for (const p of [p1, p2]) {
-			const clearance = START_CLEAR_RADIUS + wallSize + AGENT_RADIUS;
-			if (dist(p, start) < clearance) continue;
-			obstacles.push({ id: randomId("obs"), x: p.x, z: p.z, size: wallSize, height: wallHeight });
-		}
-	};
+	const wallSize = Math.min(tileSizeX, tileSizeZ) * 0.50;
 
-	for (let z = 0; z < h; z += 1) {
-		for (let x = 0; x < w; x += 1) {
-			const cx = origin + x * cellSize;
-			const cz = origin + z * cellSize;
-			openCells.push({ x: cx, z: cz });
+	for (let gz = 0; gz < gridH; gz += 1) {
+		for (let gx = 0; gx < gridW; gx += 1) {
+			const wx = originX + (gx + 0.5) * tileSizeX;
+			const wz = originZ + (gz + 0.5) * tileSizeZ;
 
-			const left = cx - cellSize / 2;
-			const right = cx + cellSize / 2;
-			const top = cz - cellSize / 2;
-			const bottom = cz + cellSize / 2;
-			const cell = cells[z][x];
-
-			// Only emit North and West walls to avoid duplicates (South/East handled by neighbors).
-			if (cell.n) addWallPair(left, top, right, top);
-			if (cell.w) addWallPair(left, top, left, bottom);
-
-			// Outer boundary of the maze grid.
-			if (x === w - 1 && cell.e) addWallPair(right, top, right, bottom);
-			if (z === h - 1 && cell.s) addWallPair(left, bottom, right, bottom);
+			if (grid[gz][gx]) {
+				const clearance = START_CLEAR_RADIUS + wallSize + AGENT_RADIUS;
+				if (dist({ x: wx, z: wz }, start) >= clearance) {
+					obstacles.push({
+						id: randomId("obs"),
+						x: wx,
+						z: wz,
+						size: wallSize,
+						height: wallHeight,
+					});
+				}
+			} else {
+				openCells.push({ x: wx, z: wz });
+			}
 		}
 	}
 
@@ -1652,11 +1676,43 @@ function BabylonWorld({
 		};
 		window.addEventListener("keydown", onKeyDown);
 
+		// Performance: only sync meshes when the underlying arrays or relevant control
+		// values change. Rendering still happens every frame for smooth camera input.
+		let lastObstacles: Obstacle[] | null = null;
+		let lastFoods: Food[] | null = null;
+		let lastAgents: Agent[] | null = null;
+		let lastSelected: string | null = null;
+		let lastShowPath = false;
+		let lastVisionRadius = -1;
+
 		engine.runRenderLoop(() => {
 			const s = stateRef.current;
-			syncObstacles(s.obstacles);
-			syncFoods(s.foods);
-			syncAgents(s.agents);
+
+			if (s.obstacles !== lastObstacles) {
+				syncObstacles(s.obstacles);
+				lastObstacles = s.obstacles;
+			}
+			if (s.foods !== lastFoods) {
+				syncFoods(s.foods);
+				lastFoods = s.foods;
+			}
+
+			const selected = selectedIdRef.current;
+			const show = Boolean(showPathRef.current);
+			const vr = visionRadiusRef.current;
+			const needAgentSync =
+				s.agents !== lastAgents ||
+				selected !== lastSelected ||
+				show !== lastShowPath ||
+				vr !== lastVisionRadius;
+			if (needAgentSync) {
+				syncAgents(s.agents);
+				lastAgents = s.agents;
+				lastSelected = selected;
+				lastShowPath = show;
+				lastVisionRadius = vr;
+			}
+
 			scene.render();
 		});
 
@@ -1736,13 +1792,35 @@ export default function NeuralVisionSim3D() {
 	useEffect(() => {
 		let raf = 0;
 		let last = performance.now();
+		let acc = 0;
+		// Throttle simulation + React/UI updates to reduce CPU and prevent long-run
+		// instability/crashes from excessive re-renders.
+		const UI_HZ = 20;
+		const UI_DT = 1 / UI_HZ;
 
 		const tick = (now: number) => {
 			const dt = Math.min((now - last) / 1000, 0.04);
 			last = now;
 
 			if (!paused) {
-				setState((prev) => stepSimulation(prev, dt, settings, startPos, visionRadius));
+				acc += dt;
+				if (acc >= UI_DT) {
+					const stepTotal = acc;
+					acc = 0;
+					setState((prev) => {
+						let next = prev;
+						let remaining = stepTotal;
+						// Chunk large dt to keep physics stable.
+						while (remaining > 0) {
+							const chunk = Math.min(remaining, 0.04);
+							next = stepSimulation(next, chunk, settings, startPos, visionRadius);
+							remaining -= chunk;
+						}
+						return next;
+					});
+				}
+			} else {
+				acc = 0;
 			}
 
 			raf = window.requestAnimationFrame(tick);
