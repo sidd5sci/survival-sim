@@ -11,24 +11,28 @@ const simulations = [
     title: '3D Survival Sandbox',
     description: 'AI bot survival simulation with obstacles, enemies, and food behavior.',
     status: 'Ready',
+		docsPath: '/docs/sim1-survival-sandbox.md',
   },
   {
     id: 'genetic-triangles-3d',
     title: 'Genetic algo 3D',
     description: '100 triangle agents evolve DNA over 5-minute generations to reach and eat distant food while avoiding obstacles.',
     status: 'Ready',
+		docsPath: '/docs/sim2-genetic-triangles.md',
   },
   {
     id: 'neural-vision-ga-3d',
     title: 'Neural Vision GA 3D',
     description: 'Agents with 5-unit vision evolve tiny neural networks where mutations can change weights, biases, neurons, and connections.',
     status: 'Ready',
+		docsPath: '/docs/sim3-neural-vision-ga.md',
   },
   {
     id: 'city-escape-ai-3d',
     title: 'City Escape AI 3D',
     description: 'One articulated bot must escape a procedural city while enemies chase; vision is sent as a low-res matrix to a configurable AI endpoint.',
     status: 'MVP',
+		docsPath: '/docs/sim4-survival.md',
   },
 ]
 
@@ -49,9 +53,14 @@ function Home() {
               <span className="pill">{sim.status}</span>
             </div>
             <p>{sim.description}</p>
-            <Link className="launch-btn" to={`/sim/${sim.id}`}>
-              Open Simulation
-            </Link>
+			<div className="sim-card-actions">
+				<Link className="launch-btn" to={`/sim/${sim.id}`}>
+					Open Simulation
+				</Link>
+				<a className="docs-btn" href={sim.docsPath} target="_blank" rel="noreferrer">
+					Read docs
+				</a>
+			</div>
           </article>
         ))}
       </section>

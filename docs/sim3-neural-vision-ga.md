@@ -17,6 +17,7 @@ This sim adds:
 
 Notes:
 - Obstacles are distributed across the full world (all directions).
+- A small spawn area near the start is kept clear (no obstacles within ~6 units).
 - The world boundary has visible walls and creatures treat the boundary as an obstacle.
 
 ## Interaction
@@ -29,6 +30,8 @@ Notes:
 - **Pause / Resume**
 - **Restart**
 - **Vision Radius**: adjusts how far creatures can sense food/obstacles.
+- **Iteration Duration**: generation length in seconds (default 180s / 3 min).
+- **Paths**: show/hide trails (for all creatures).
 - **Learning** toggle + **Learning Rate** (optional Lamarckian learning)
 - GA parameters:
   - Mutation Rate / Strength
@@ -42,18 +45,24 @@ Notes:
   - Shows a neural network graph
 
 ## Creature perception (inputs)
-Input layer is fixed (`INPUTS = 8`). Inputs represent **nearest visible** food and obstacle (within radius AND within 120° FOV):
-1. Food direction **right/left** in creature-local space
-2. Food direction **forward** in creature-local space
-3. Food proximity (0..1)
-4. Obstacle direction **right/left** in creature-local space
-5. Obstacle direction **forward** in creature-local space
-6. Obstacle proximity (0..1)
-7. Current velocity x normalized
-8. Current velocity z normalized
+Input layer is fixed (`INPUTS = 10`). Inputs represent **nearest visible** food and obstacle (within radius AND within 120° FOV), plus health-awareness signals:
+1. `Fx`: Food direction **right/left** in creature-local space
+2. `Fz`: Food direction **forward** in creature-local space
+3. `Fd`: Food proximity (0..1)
+4. `Ox`: Obstacle/wall direction **right/left** in creature-local space
+5. `Oz`: Obstacle/wall direction **forward** in creature-local space
+6. `Od`: Obstacle/wall proximity (0..1)
+7. `Vx`: Current velocity x normalized (-1..1)
+8. `Vz`: Current velocity z normalized (-1..1)
+9. `En`: Energy normalized (0..1)
+10. `Fit`: Fitness normalized (0..1)
 
 Visibility filtering:
 - A target is considered visible only if it is within radius AND within the 120° cone in front of the creature.
+
+Boundary walls:
+- Walls are treated as a virtual obstacle.
+- Wall sensing uses nearest-wall distance, so walls remain “visible” even while sliding along them.
 
 ## Neural policy (outputs)
 Output layer is fixed (`OUTPUTS = 5`). Outputs are action neurons:
@@ -82,39 +91,44 @@ The graph shown in the UI renders all hidden layers and their inter-layer connec
   - drains faster under higher acceleration
 - Eating food increases energy.
 - If energy reaches 0:
-  - creature dies
-  - stops moving
-  - receives a fitness penalty
+- If energy reaches 0 the creature effectively stops (no movement).
 
 ## Collision behavior
 - Creatures are prevented from passing through obstacles by sub-stepped integration and penetration resolution against obstacle circles (obstacle size + agent radius) in the XZ plane.
+
+Collision energy loss:
+- On collision with an obstacle or wall, a creature loses a small fixed amount of energy (0.5).
 
 Boundary behavior:
 - The world boundary behaves like a wall. Hitting/clamping at the boundary counts as a collision.
 - For perception, the boundary is treated as a “virtual obstacle” so creatures learn to avoid edges.
 
 ## Fitness (high level)
-Fitness rewards:
-- Food eaten
-- Progress toward food
-- Faster arrival
+Fitness is strictly **0..100** and starts at **100**.
 
-Fitness penalties:
-- Collisions
-- Death
+Penalties reduce fitness:
+- More collisions
+- Lower energy
+- Slower time-to-first-fruit
+
+Rewards increase fitness (but clamped to 100):
+- More fruits eaten
+- Faster eating rate
+- Higher energy (above the start energy)
 
 ## Notes
 - The GA runs for a fixed generation duration and then breeds a new population.
 - Optional learning can nudge weights during a generation; that change is written back to DNA.
 
 ### Parent selection (breeding)
-Parents for crossover are selected with a weighted score that rewards:
-- High fitness
-- High remaining energy
-- Eating the first food quickly (lower `firstFoodTime`)
-
-This makes the next generation converge toward creatures that are both effective and efficient.
+For crossover, parents are chosen only from the **top 10** creatures by fitness.
+Elites are copied into the next generation (elite count is configurable).
 
 ### Crossover-time mutation
 When crossover happens, the child genome also receives a small additional “jitter” on some weights/biases.
 This reduces the chance that crossover produces an offspring identical to a parent.
+
+## Genome export/import
+- You can export the **best 10** genomes as a JSON file.
+- You can load a previously exported JSON file to restart the sim seeded with those genomes.
+- The loader is compatible with older exports (it pads missing inputs if the input count changed).

@@ -76,6 +76,11 @@ type SavedSim3GenomesV1 = {
 	version: 1;
 	sim: "sim3";
 	createdAt: string;
+	// Optional metadata (ignored by the loader/validator, but useful for debugging compatibility).
+	net?: {
+		inputs: number;
+		outputs: number;
+	};
 	top: Array<{
 		fitness: number;
 		energy: number;
@@ -93,7 +98,7 @@ const DEFAULT_GENERATION_SECONDS = 180;
 const FOOD_COUNT = 8;
 const OBSTACLE_COUNT = 30;
 const DEFAULT_VISION_RADIUS = 5;
-const INPUTS = 8;
+const INPUTS = 10;
 const OUTPUTS = 5;
 const OUT_LEFT = 0;
 const OUT_RIGHT = 1;
@@ -112,8 +117,8 @@ const ENERGY_GAIN_PER_FOOD = 25;
 const ENERGY_DRAIN_BASE_PER_SEC = 0.04;
 const ENERGY_DRAIN_SPEED_PER_UNIT = 0.06;
 const ENERGY_DRAIN_ACCEL_PER_UNIT = 0.015;
-const DEAD_FITNESS_PENALTY = 2000;
 const COLLISION_FITNESS_PENALTY = 8;
+const COLLISION_ENERGY_LOSS = 0.5;
 
 const START_CLEAR_RADIUS = 6;
 
@@ -127,6 +132,8 @@ const CROSSOVER_JITTER_STRENGTH = 0.22;
 const BREEDING_ENERGY_BONUS = 2600;
 // Also reward eating the first food quickly (lower time is better).
 const BREEDING_FIRST_FOOD_BONUS = 2200;
+
+const CROSSOVER_PARENT_POOL_SIZE = 10;
 
 const VISION_FOV_DEG = 120;
 const VISION_HALF_FOV_RAD = (VISION_FOV_DEG * Math.PI) / 360;
@@ -226,6 +233,32 @@ function randomWeight(): number {
 
 function randomMask(): number {
 	return Math.random() < 0.7 ? 1 : 0;
+}
+
+function ensureGenomeInputShape(genome: BrainGenome): BrainGenome {
+	// Backward/forward compatibility: if saved genomes were created with a different INPUTS count,
+	// pad/slice input weight + mask rows so forwardPass can safely iterate 0..INPUTS-1.
+	const next = cloneGenome(genome);
+
+	const fixRowLen = (row: number[], targetLen: number, fill: () => number) => {
+		if (row.length > targetLen) return row.slice(0, targetLen);
+		if (row.length === targetLen) return row;
+		const out = [...row];
+		while (out.length < targetLen) out.push(fill());
+		return out;
+	};
+
+	while (next.inputHiddenWeights.length < INPUTS) next.inputHiddenWeights.push([]);
+	while (next.inputHiddenMask.length < INPUTS) next.inputHiddenMask.push([]);
+	if (next.inputHiddenWeights.length > INPUTS) next.inputHiddenWeights = next.inputHiddenWeights.slice(0, INPUTS);
+	if (next.inputHiddenMask.length > INPUTS) next.inputHiddenMask = next.inputHiddenMask.slice(0, INPUTS);
+
+	for (let i = 0; i < INPUTS; i += 1) {
+		next.inputHiddenWeights[i] = fixRowLen(next.inputHiddenWeights[i] ?? [], next.hiddenSize, randomWeight);
+		next.inputHiddenMask[i] = fixRowLen(next.inputHiddenMask[i] ?? [], next.hiddenSize, randomMask);
+	}
+
+	return next;
 }
 
 function applyCrossoverJitter(genome: BrainGenome): BrainGenome {
@@ -485,6 +518,7 @@ function crossoverGenomes(a: BrainGenome, b: BrainGenome, crossoverRate: number)
 }
 
 function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
+	const safeGenome = ensureGenomeInputShape(genome);
 	return {
 		id: randomId("agent"),
 		x: start.x + rand(-0.8, 0.8),
@@ -499,11 +533,11 @@ function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
 		firstFoodTime: null,
 		minFoodDistance: nearestFoodDistance(start, foods),
 		collisions: 0,
-		fitness: 0,
-		genome,
+		fitness: 100,
+		genome: safeGenome,
 		brain: {
 			inputs: new Array(INPUTS).fill(0),
-			hidden: Array.from({ length: genome.hiddenLayers }, () => new Array(genome.hiddenSize).fill(0)),
+			hidden: Array.from({ length: safeGenome.hiddenLayers }, () => new Array(safeGenome.hiddenSize).fill(0)),
 			outputs: new Array(OUTPUTS).fill(0),
 		},
 		eatenMask: new Array(foods.length).fill(false),
@@ -531,8 +565,9 @@ function createInitialState(settings: EvoSettings, seedGenomes?: BrainGenome[]):
 }
 
 function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], visionRadius: number): number[] {
-	const hx = agent.headingX;
-	const hz = agent.headingZ;
+	const h = normalize(agent.headingX, agent.headingZ);
+	const hx = h.x;
+	const hz = h.z;
 	// Right vector in XZ plane (90° clockwise from forward).
 	const rx = hz;
 	const rz = -hx;
@@ -568,24 +603,36 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], vis
 		}
 	}
 
-	// Boundary walls as a "virtual obstacle" so creatures treat edges like obstacles.
-	// We approximate the wall by the closest point on each boundary edge.
-	const wallCandidates: Vec2[] = [
-		{ x: HALF, z: clamp(agent.z, -HALF, HALF) },
-		{ x: -HALF, z: clamp(agent.z, -HALF, HALF) },
-		{ x: clamp(agent.x, -HALF, HALF), z: HALF },
-		{ x: clamp(agent.x, -HALF, HALF), z: -HALF },
-	];
+	// Boundary walls as a "virtual obstacle".
+	// IMPORTANT: use nearest wall distance (NOT FOV-gated).
+	// When an agent slides along a wall, the wall is usually sideways; if we rely on FOV
+	// or forward-ray intersection, walls become effectively invisible.
 	let nearestWall: Vec2 | null = null;
 	let nearestWallDist = visionRadius + 1;
-	for (const p of wallCandidates) {
-		const d = dist(agent, p);
-		if (d > visionRadius || d >= nearestWallDist) continue;
-		const nxz = normalize(p.x - agent.x, p.z - agent.z);
-		const dot = nxz.x * hx + nxz.z * hz;
-		if (dot < VISION_COS_THRESHOLD) continue;
-		nearestWallDist = d;
-		nearestWall = p;
+	{
+		const dxPos = HALF - agent.x;
+		const dxNeg = agent.x + HALF;
+		const dzPos = HALF - agent.z;
+		const dzNeg = agent.z + HALF;
+		let bestD = dxPos;
+		let wallPoint: Vec2 = { x: HALF, z: agent.z };
+		if (dxNeg < bestD) {
+			bestD = dxNeg;
+			wallPoint = { x: -HALF, z: agent.z };
+		}
+		if (dzPos < bestD) {
+			bestD = dzPos;
+			wallPoint = { x: agent.x, z: HALF };
+		}
+		if (dzNeg < bestD) {
+			bestD = dzNeg;
+			wallPoint = { x: agent.x, z: -HALF };
+		}
+
+		if (bestD <= visionRadius) {
+			nearestWallDist = bestD;
+			nearestWall = wallPoint;
+		}
 	}
 
 	// Choose the closer of: real obstacle or boundary wall.
@@ -628,6 +675,8 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], vis
 		obsDist,
 		clamp(agent.vx / MAX_SPEED, -1, 1),
 		clamp(agent.vz / MAX_SPEED, -1, 1),
+		clamp(agent.energy / Math.max(1, MAX_ENERGY), 0, 1),
+		clamp(agent.fitness / 100, 0, 1),
 	];
 }
 
@@ -737,26 +786,38 @@ function learnGenome(genome: BrainGenome, inputs: number[], hiddenLayers: number
 	return next;
 }
 
-function computeFitness(agent: Agent, elapsed: number, initialNearest: number, generationSeconds: number): number {
-	const progress = clamp(initialNearest - agent.minFoodDistance, 0, initialNearest);
-	const speedReward = progress / Math.max(elapsed, 1);
-	const firstFoodBonus = agent.firstFoodTime == null ? 0 : Math.max(0, generationSeconds - agent.firstFoodTime) * 0.65;
-	const alivePenalty = agent.alive ? 0 : DEAD_FITNESS_PENALTY;
-	return agent.foodsEaten * 1500 + progress * 10 + speedReward * 500 + firstFoodBonus - agent.collisions * COLLISION_FITNESS_PENALTY - alivePenalty;
+function computeFitness(agent: Agent, elapsed: number, generationSeconds: number): number {
+	// Fitness is strictly 0..100.
+	// Requirement: starting fitness is 100, and penalties reduce fitness.
+	const base = 100;
+
+	// Penalties (reduce fitness)
+	const collisionPenalty = clamp(agent.collisions * 0.6, 0, 60);
+	const energyPenalty = clamp((START_ENERGY - agent.energy) / Math.max(1, START_ENERGY), 0, 1) * 25;
+	const timeRef = agent.firstFoodTime ?? elapsed;
+	const timePenalty = clamp(timeRef / Math.max(1, generationSeconds), 0, 1) * 20;
+
+	// Bonuses (can recover fitness, but we still clamp to 100)
+	const fruitsBonus = clamp(agent.foodsEaten / Math.max(1, FOOD_COUNT), 0, 1) * 40;
+	const energyBonus = clamp((agent.energy - START_ENERGY) / Math.max(1, MAX_ENERGY - START_ENERGY), 0, 1) * 15;
+	let speedBonus = 0;
+	if (agent.foodsEaten > 0) {
+		const rate = agent.foodsEaten / Math.max(0.0001, elapsed);
+		const targetRate = FOOD_COUNT / Math.max(1, generationSeconds);
+		const rate01 = clamp(rate / Math.max(0.0001, targetRate), 0, 1);
+		speedBonus = rate01 * 15;
+	}
+
+	return clamp(base - collisionPenalty - energyPenalty - timePenalty + fruitsBonus + energyBonus + speedBonus, 0, 100);
 }
 
 function breedingScore(agent: Agent, generationSeconds: number): number {
-	const energy01 = clamp(agent.energy / Math.max(1, MAX_ENERGY), 0, 1);
-	const firstFood01 =
-		agent.firstFoodTime == null
-			? 0
-			: clamp((generationSeconds - agent.firstFoodTime) / Math.max(1, generationSeconds), 0, 1);
-	return agent.fitness + energy01 * BREEDING_ENERGY_BONUS + firstFood01 * BREEDING_FIRST_FOOD_BONUS;
+	// Fitness already includes energy + fruits + time + collisions, and is 0..100.
+	return agent.fitness;
 }
 
 function selectParent(pool: Agent[], generationSeconds: number): Agent {
-	const minScore = Math.min(...pool.map((a) => breedingScore(a, generationSeconds)));
-	const offset = minScore < 0 ? Math.abs(minScore) + 1 : 1;
+	const offset = 1;
 	const total = pool.reduce((sum, a) => sum + breedingScore(a, generationSeconds) + offset, 0);
 	let roll = Math.random() * total;
 	for (const a of pool) {
@@ -775,7 +836,8 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	const bestPrev = rankedByFitness[0]?.fitness ?? 0;
 	const eliteCount = clamp(settings.eliteCount, 1, rankedByFitness.length);
 	const elites = rankedByFitness.slice(0, eliteCount);
-	const breedingPool = [...state.agents].sort((a, b) => breedingScore(b, generationSeconds) - breedingScore(a, generationSeconds));
+	// For crossover, only choose from the top 10 most fit creatures.
+	const breedingPool = rankedByFitness.slice(0, Math.min(CROSSOVER_PARENT_POOL_SIZE, rankedByFitness.length));
 
 	const nextAgents: Agent[] = [];
 	for (const elite of elites) {
@@ -809,7 +871,6 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, startPos: Vec2, visionRadius: number): SimState {
 	const generationSeconds = clamp(Math.round(settings.generationSeconds), 20, 60 * 60);
 	const elapsed = prev.elapsedSeconds + dt;
-	const baseNearest = nearestFoodDistance(startPos, prev.foods);
 
 	const updatedAgents = prev.agents.map((agent) => {
 		if (!agent.alive || agent.energy <= 0) {
@@ -821,7 +882,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 				vz: 0,
 				fitness: 0,
 			};
-			deadAgent.fitness = computeFitness(deadAgent, elapsed, baseNearest, generationSeconds);
+			deadAgent.fitness = computeFitness(deadAgent, elapsed, generationSeconds);
 			return deadAgent;
 		}
 
@@ -859,7 +920,15 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 			const rawZ = z + vz * dtStep;
 			x = clamp(rawX, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
 			z = clamp(rawZ, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
-			if (x !== rawX || z !== rawZ) collidedThisStep = true;
+			if (x !== rawX) {
+				// Remove the velocity component pushing into the wall.
+				vx = 0;
+				collidedThisStep = true;
+			}
+			if (z !== rawZ) {
+				vz = 0;
+				collidedThisStep = true;
+			}
 
 			for (const obstacle of prev.obstacles) {
 				const dx = x - obstacle.x;
@@ -877,7 +946,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 		const speed = Math.sqrt(vx * vx + vz * vz);
 		const accelMag = Math.sqrt((vx - prevVx) * (vx - prevVx) + (vz - prevVz) * (vz - prevVz)) / Math.max(dt, 1e-6);
 		const drainPerSec = ENERGY_DRAIN_BASE_PER_SEC + ENERGY_DRAIN_SPEED_PER_UNIT * speed + ENERGY_DRAIN_ACCEL_PER_UNIT * accelMag;
-		let energy = clamp(agent.energy - drainPerSec * dt, 0, MAX_ENERGY);
+		let energy = clamp(agent.energy - drainPerSec * dt - (collidedThisStep ? COLLISION_ENERGY_LOSS : 0), 0, MAX_ENERGY);
 		let alive = energy > 0;
 		if (!alive) {
 			vx = 0;
@@ -942,7 +1011,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 				outputs: out,
 			},
 		};
-		nextAgent.fitness = computeFitness(nextAgent, elapsed, baseNearest, generationSeconds);
+		nextAgent.fitness = computeFitness(nextAgent, elapsed, generationSeconds);
 		return nextAgent;
 	});
 
@@ -1322,7 +1391,7 @@ function BabylonWorld({
 							`path-${a.id}`,
 							{
 								path: safePath,
-								instance: entry.tube,
+								instance: entry.tube ?? undefined,
 								radius: PATH_TUBE_RADIUS,
 								tessellation: 8,
 								cap: BABYLON.Mesh.CAP_ALL,
@@ -1544,6 +1613,10 @@ export default function NeuralVisionSim3D() {
 			version: 1,
 			sim: "sim3",
 			createdAt: new Date().toISOString(),
+			net: {
+				inputs: INPUTS,
+				outputs: OUTPUTS,
+			},
 			top,
 		};
 		downloadJson("sim3-top10-genomes.json", payload);
@@ -1554,11 +1627,18 @@ export default function NeuralVisionSim3D() {
 		try {
 			const text = await file.text();
 			const json = JSON.parse(text);
-			if (!isSavedSim3GenomesV1(json)) {
+			let genomes: BrainGenome[] = [];
+			if (isSavedSim3GenomesV1(json)) {
+				genomes = json.top.map((e) => e.genome).filter(Boolean);
+			} else if (Array.isArray(json)) {
+				// Allow loading a raw array of genomes.
+				genomes = json.filter(Boolean);
+			} else {
 				throw new Error("Invalid file format. Expected a Sim 3 genomes export.");
 			}
-			const genomes = json.top.map((e) => e.genome).filter(Boolean);
-			restart(genomes);
+
+			const safe = genomes.map((g) => ensureGenomeInputShape(g));
+			restart(safe);
 			setSelectedAgentId(null);
 		} catch (e: any) {
 			setGenomeLoadError(String(e?.message ?? e));
@@ -1584,7 +1664,7 @@ export default function NeuralVisionSim3D() {
 						<CardContent className="space-y-4">
 							<div className="grid grid-cols-2 gap-2">
 								<Button onClick={() => setPaused((p) => !p)}>{paused ? "Resume" : "Pause"}</Button>
-								<Button variant="secondary" onClick={restart}>Restart</Button>
+								<Button variant="secondary" onClick={() => restart()}>Restart</Button>
 							</div>
 
 							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-1">
@@ -1750,7 +1830,7 @@ function NeuralNetGraph({
 	const hiddenYs = Array.from({ length: genome.hiddenSize }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, genome.hiddenSize - 1));
 	const outputYs = Array.from({ length: OUTPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, OUTPUTS - 1));
 
-	const inputLabels = ["Fx", "Fz", "Fd", "Ox", "Oz", "Od", "Vx", "Vz"];
+	const inputLabels = ["Fx", "Fz", "Fd", "Ox", "Oz", "Od", "Vx", "Vz", "En", "Fit"];
 	const outputLabels = ["L", "R", "F", "B", "S"];
 
 	const clamp01 = (v: number) => clamp(v, 0, 1);
