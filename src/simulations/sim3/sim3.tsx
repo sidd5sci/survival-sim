@@ -55,6 +55,8 @@ type EvoSettings = {
 	eliteCount: number;
 	topologyMutationRate: number;
 	crossoverRate: number;
+	// Generation duration in seconds.
+	generationSeconds: number;
 	// If enabled, agents can update their own DNA weights/biases during a generation.
 	learningEnabled?: boolean;
 	learningRate?: number;
@@ -87,7 +89,7 @@ const WORLD_SIZE = 84;
 const HALF = WORLD_SIZE / 2;
 const AGENT_RADIUS = 0.35;
 const FOOD_RADIUS = 0.6;
-const GENERATION_SECONDS = 300;
+const DEFAULT_GENERATION_SECONDS = 180;
 const FOOD_COUNT = 8;
 const OBSTACLE_COUNT = 30;
 const DEFAULT_VISION_RADIUS = 5;
@@ -111,6 +113,9 @@ const ENERGY_DRAIN_BASE_PER_SEC = 0.04;
 const ENERGY_DRAIN_SPEED_PER_UNIT = 0.06;
 const ENERGY_DRAIN_ACCEL_PER_UNIT = 0.015;
 const DEAD_FITNESS_PENALTY = 2000;
+const COLLISION_FITNESS_PENALTY = 8;
+
+const START_CLEAR_RADIUS = 6;
 
 // Add a small amount of additional exploration specifically during crossover so
 // offspring don't frequently end up identical to a parent (especially with low mutation).
@@ -187,14 +192,24 @@ function createFoods(): Food[] {
 
 function createObstacles(): Obstacle[] {
 	const obstacles: Obstacle[] = [];
-	for (let i = 0; i < OBSTACLE_COUNT; i += 1) {
-		obstacles.push({
+	const start = { x: -HALF + 8, z: -HALF + 8 };
+	let attempts = 0;
+	const maxAttempts = OBSTACLE_COUNT * 80;
+	while (obstacles.length < OBSTACLE_COUNT && attempts < maxAttempts) {
+		attempts += 1;
+		const candidate: Obstacle = {
 			id: randomId("obs"),
 			x: rand(-HALF + 8, HALF - 8),
 			z: rand(-HALF + 8, HALF - 8),
 			size: rand(1.2, 2.8),
 			height: rand(1.5, 4.2),
-		});
+		};
+
+		// Keep the spawn area clear (6 units from start), plus a small size buffer.
+		const clearance = START_CLEAR_RADIUS + candidate.size + AGENT_RADIUS;
+		if (dist(candidate, start) < clearance) continue;
+
+		obstacles.push(candidate);
 	}
 	return obstacles;
 }
@@ -722,36 +737,37 @@ function learnGenome(genome: BrainGenome, inputs: number[], hiddenLayers: number
 	return next;
 }
 
-function computeFitness(agent: Agent, elapsed: number, initialNearest: number): number {
+function computeFitness(agent: Agent, elapsed: number, initialNearest: number, generationSeconds: number): number {
 	const progress = clamp(initialNearest - agent.minFoodDistance, 0, initialNearest);
 	const speedReward = progress / Math.max(elapsed, 1);
-	const firstFoodBonus = agent.firstFoodTime == null ? 0 : Math.max(0, GENERATION_SECONDS - agent.firstFoodTime) * 0.65;
+	const firstFoodBonus = agent.firstFoodTime == null ? 0 : Math.max(0, generationSeconds - agent.firstFoodTime) * 0.65;
 	const alivePenalty = agent.alive ? 0 : DEAD_FITNESS_PENALTY;
-	return agent.foodsEaten * 1500 + progress * 10 + speedReward * 500 + firstFoodBonus - agent.collisions * 16 - alivePenalty;
+	return agent.foodsEaten * 1500 + progress * 10 + speedReward * 500 + firstFoodBonus - agent.collisions * COLLISION_FITNESS_PENALTY - alivePenalty;
 }
 
-function breedingScore(agent: Agent): number {
+function breedingScore(agent: Agent, generationSeconds: number): number {
 	const energy01 = clamp(agent.energy / Math.max(1, MAX_ENERGY), 0, 1);
 	const firstFood01 =
 		agent.firstFoodTime == null
 			? 0
-			: clamp((GENERATION_SECONDS - agent.firstFoodTime) / Math.max(1, GENERATION_SECONDS), 0, 1);
+			: clamp((generationSeconds - agent.firstFoodTime) / Math.max(1, generationSeconds), 0, 1);
 	return agent.fitness + energy01 * BREEDING_ENERGY_BONUS + firstFood01 * BREEDING_FIRST_FOOD_BONUS;
 }
 
-function selectParent(pool: Agent[]): Agent {
-	const minScore = Math.min(...pool.map((a) => breedingScore(a)));
+function selectParent(pool: Agent[], generationSeconds: number): Agent {
+	const minScore = Math.min(...pool.map((a) => breedingScore(a, generationSeconds)));
 	const offset = minScore < 0 ? Math.abs(minScore) + 1 : 1;
-	const total = pool.reduce((sum, a) => sum + breedingScore(a) + offset, 0);
+	const total = pool.reduce((sum, a) => sum + breedingScore(a, generationSeconds) + offset, 0);
 	let roll = Math.random() * total;
 	for (const a of pool) {
-		roll -= breedingScore(a) + offset;
+		roll -= breedingScore(a, generationSeconds) + offset;
 		if (roll <= 0) return a;
 	}
 	return pool[pool.length - 1];
 }
 
 function evolve(state: SimState, settings: EvoSettings): SimState {
+	const generationSeconds = clamp(Math.round(settings.generationSeconds), 20, 60 * 60);
 	const start = { x: -HALF + 8, z: -HALF + 8 };
 	const foods = createFoods();
 	const obstacles = createObstacles();
@@ -759,7 +775,7 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	const bestPrev = rankedByFitness[0]?.fitness ?? 0;
 	const eliteCount = clamp(settings.eliteCount, 1, rankedByFitness.length);
 	const elites = rankedByFitness.slice(0, eliteCount);
-	const breedingPool = [...state.agents].sort((a, b) => breedingScore(b) - breedingScore(a));
+	const breedingPool = [...state.agents].sort((a, b) => breedingScore(b, generationSeconds) - breedingScore(a, generationSeconds));
 
 	const nextAgents: Agent[] = [];
 	for (const elite of elites) {
@@ -767,8 +783,8 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	}
 
 	while (nextAgents.length < settings.population) {
-		const parentA = selectParent(breedingPool);
-		const parentB = selectParent(breedingPool);
+		const parentA = selectParent(breedingPool, generationSeconds);
+		const parentB = selectParent(breedingPool, generationSeconds);
 		const crossed = crossoverGenomes(parentA.genome, parentB.genome, settings.crossoverRate);
 		const mutated = mutateGenome(crossed, settings);
 		nextAgents.push(createAgent(start, foods, mutated));
@@ -791,6 +807,7 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 }
 
 function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, startPos: Vec2, visionRadius: number): SimState {
+	const generationSeconds = clamp(Math.round(settings.generationSeconds), 20, 60 * 60);
 	const elapsed = prev.elapsedSeconds + dt;
 	const baseNearest = nearestFoodDistance(startPos, prev.foods);
 
@@ -804,7 +821,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 				vz: 0,
 				fitness: 0,
 			};
-			deadAgent.fitness = computeFitness(deadAgent, elapsed, baseNearest);
+			deadAgent.fitness = computeFitness(deadAgent, elapsed, baseNearest, generationSeconds);
 			return deadAgent;
 		}
 
@@ -925,12 +942,12 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 				outputs: out,
 			},
 		};
-		nextAgent.fitness = computeFitness(nextAgent, elapsed, baseNearest);
+		nextAgent.fitness = computeFitness(nextAgent, elapsed, baseNearest, generationSeconds);
 		return nextAgent;
 	});
 
 	const next: SimState = { ...prev, elapsedSeconds: elapsed, agents: updatedAgents };
-	if (elapsed >= GENERATION_SECONDS) return evolve(next, settings);
+	if (elapsed >= generationSeconds) return evolve(next, settings);
 	return next;
 }
 
@@ -994,23 +1011,24 @@ function BabylonWorld({
 	}, [showPath]);
 
 	const createAgentTriangle = (name: string, scene: BABYLON.Scene) => {
-		// A small triangular prism pointing along +Z.
-		// We'll rotate it around Y to face its velocity direction.
+		// A small 3D wedge (tapered triangular prism) pointing along +Z.
+		// We'll rotate it around Y to face its heading.
 		const mesh = new BABYLON.Mesh(name, scene);
-		const tipZ = 0.6;
-		const baseZ = -0.3;
-		const halfW = 0.36;
-		const thicknessY = 0.18;
+		const tipZ = 0.75;
+		const baseZ = -0.42;
+		const halfW = 0.42;
+		const thicknessY = 0.34;
+		const taper = 0.78;
 
 		const positions = [
-			// bottom
+			// bottom (full size)
 			0, 0, tipZ,
 			-halfW, 0, baseZ,
 			halfW, 0, baseZ,
-			// top
-			0, thicknessY, tipZ,
-			-halfW, thicknessY, baseZ,
-			halfW, thicknessY, baseZ,
+			// top (slightly tapered so it reads as 3D)
+			0, thicknessY, tipZ * (0.85 + taper * 0.15),
+			-halfW * taper, thicknessY, baseZ * (0.85 + taper * 0.15),
+			halfW * taper, thicknessY, baseZ * (0.85 + taper * 0.15),
 		];
 
 		const indices = [
@@ -1218,7 +1236,7 @@ function BabylonWorld({
 				// Face the persistent heading (stable even at low speed).
 				const yaw = Math.atan2(a.headingX, a.headingZ);
 				mesh.rotation.set(0, yaw, 0);
-				mesh.position.set(a.x, 0.06, a.z);
+				mesh.position.set(a.x, 0.02, a.z);
 
 				const isBest = best?.id === a.id;
 				const hue = clamp(120 - a.foodsEaten * 16 - a.collisions * 0.6, 0, 120);
@@ -1443,6 +1461,7 @@ export default function NeuralVisionSim3D() {
 		eliteCount: 10,
 		topologyMutationRate: 0.06,
 		crossoverRate: 0.8,
+		generationSeconds: DEFAULT_GENERATION_SECONDS,
 		// Optional learning (Lamarckian): creatures can slightly adjust their own weights during a generation.
 		learningEnabled: true,
 		learningRate: 0.03,
@@ -1570,7 +1589,7 @@ export default function NeuralVisionSim3D() {
 
 							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-1">
 								<div>Generation: <strong>{state.generation}</strong></div>
-								<div>Timer: <strong>{state.elapsedSeconds.toFixed(1)}s / 300s</strong></div>
+								<div>Timer: <strong>{state.elapsedSeconds.toFixed(1)}s / {Math.round(settings.generationSeconds)}s</strong></div>
 								<div>Population: <strong>{state.agents.length}</strong></div>
 								<div>Vision Radius: <strong>{visionRadius.toFixed(1)} units</strong></div>
 								<div>Best (current): <strong>{bestCurrent ? bestCurrent.fitness.toFixed(1) : "0.0"}</strong></div>
@@ -1585,6 +1604,19 @@ export default function NeuralVisionSim3D() {
 								<div>
 									<div className="flex justify-between text-sm mb-1"><span>Vision Radius</span><span>{visionRadius.toFixed(1)}</span></div>
 									<Slider value={[visionRadius]} min={1} max={16} step={0.5} onValueChange={(v: number[]) => setVisionRadius(v[0])} />
+								</div>
+								<div>
+									<div className="flex justify-between text-sm mb-1"><span>Iteration Duration</span><span>{Math.round(settings.generationSeconds)}s</span></div>
+									<Slider
+										value={[settings.generationSeconds]}
+										min={60}
+										max={600}
+										step={15}
+										onValueChange={(v: number[]) =>
+											setSettings((p) => ({ ...p, generationSeconds: Math.round(clamp(v[0], 20, 60 * 60)) }))
+										}
+									/>
+									<div className="text-xs text-slate-300 mt-1">Default: 180s (3 min). No restart needed.</div>
 								</div>
 								<div>
 									<div className="flex justify-between text-sm mb-1"><span>Paths</span><span>{showPath ? "On" : "Off"}</span></div>
@@ -1675,7 +1707,7 @@ export default function NeuralVisionSim3D() {
 									<>
 										<div className="text-xs text-slate-300">Hidden layers: {selectedAgent.genome.hiddenLayers} · neurons/layer: {selectedAgent.genome.hiddenSize}</div>
 										<div className="text-xs text-slate-300">Energy: {selectedAgent.energy.toFixed(1)} / {MAX_ENERGY} · {selectedAgent.alive ? "Alive" : "Dead"}</div>
-										<NeuralNetGraph genome={selectedAgent.genome} />
+										<NeuralNetGraph genome={selectedAgent.genome} brain={selectedAgent.brain} />
 										{/* <div className="text-xs text-slate-300">DNA (genome)</div>
 										<pre className="max-h-[220px] overflow-auto rounded-lg border border-slate-700 bg-slate-950/40 p-2 text-[11px] leading-snug text-slate-200">
 											{JSON.stringify(selectedAgent.genome, null, 2)}
@@ -1696,7 +1728,17 @@ export default function NeuralVisionSim3D() {
 }
 
 // Visualize a genome as a simple layered neural net graph (inputs -> hidden -> outputs).
-function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
+function NeuralNetGraph({
+	genome,
+	brain,
+}: {
+	genome: BrainGenome;
+	brain?: {
+		inputs: number[];
+		hidden: number[][];
+		outputs: number[];
+	};
+}) {
 	const width = 300;
 	const height = 180;
 	const padY = 14;
@@ -1708,11 +1750,30 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 	const hiddenYs = Array.from({ length: genome.hiddenSize }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, genome.hiddenSize - 1));
 	const outputYs = Array.from({ length: OUTPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, OUTPUTS - 1));
 
-	const strokeForWeight = (w: number) => {
+	const inputLabels = ["Fx", "Fz", "Fd", "Ox", "Oz", "Od", "Vx", "Vz"];
+	const outputLabels = ["L", "R", "F", "B", "S"];
+
+	const clamp01 = (v: number) => clamp(v, 0, 1);
+	const normAct = (v: number | undefined) => {
+		if (!Number.isFinite(v as number)) return 0;
+		// Inputs/outputs are typically in [-1,1] (or [0,1]); normalize to [-1,1].
+		return clamp(Number(v), -1, 1);
+	};
+	const actAlpha = (v: number | undefined) => 0.15 + 0.85 * clamp01(Math.abs(normAct(v)));
+	const actColor = (v: number | undefined, fallback: string) => {
+		const a = normAct(v);
+		if (Math.abs(a) < 1e-3) return fallback;
+		return a >= 0 ? "#38bdf8" : "#fb7185";
+	};
+	const actRadius = (base: number, v: number | undefined) => base * (0.85 + 0.55 * clamp01(Math.abs(normAct(v))));
+
+	const strokeForWeight = (w: number, sourceAct?: number, targetAct?: number) => {
 		const abs = Math.min(1, Math.abs(w) / 2);
 		const width = 0.5 + abs * 2.2;
 		const color = w >= 0 ? "#38bdf8" : "#fb7185";
-		return { width, color, opacity: 0.2 + abs * 0.6 };
+		const actBoost = brain ? clamp01((Math.abs(normAct(sourceAct)) + Math.abs(normAct(targetAct))) * 0.5) : 0;
+		const opacity = 0.08 + abs * 0.55 + actBoost * 0.35;
+		return { width, color, opacity };
 	};
 
 	return (
@@ -1722,7 +1783,7 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 				Array.from({ length: genome.hiddenSize }, (_, h) => {
 					if (genome.inputHiddenMask[i][h] <= 0.5) return null;
 					const w = genome.inputHiddenWeights[i][h];
-					const s = strokeForWeight(w);
+					const s = strokeForWeight(w, brain?.inputs?.[i], brain?.hidden?.[0]?.[h]);
 					return (
 						<line
 							key={`ih-${i}-${h}`}
@@ -1744,7 +1805,7 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 					Array.from({ length: genome.hiddenSize }, (_, h) => {
 						if ((genome.hiddenHiddenMask[l]?.[i]?.[h] ?? 0) <= 0.5) return null;
 						const w = genome.hiddenHiddenWeights[l]?.[i]?.[h] ?? 0;
-						const s = strokeForWeight(w);
+						const s = strokeForWeight(w, brain?.hidden?.[l]?.[i], brain?.hidden?.[l + 1]?.[h]);
 						return (
 							<line
 								key={`hh-${l}-${i}-${h}`}
@@ -1766,7 +1827,7 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 				Array.from({ length: OUTPUTS }, (_, o) => {
 					if (genome.hiddenOutputMask[h][o] <= 0.5) return null;
 					const w = genome.hiddenOutputWeights[h][o];
-					const s = strokeForWeight(w);
+					const s = strokeForWeight(w, brain?.hidden?.[genome.hiddenLayers - 1]?.[h], brain?.outputs?.[o]);
 					return (
 						<line
 							key={`ho-${h}-${o}`}
@@ -1784,13 +1845,68 @@ function NeuralNetGraph({ genome }: { genome: BrainGenome }) {
 
 			{/* Nodes */}
 			{inputYs.map((y, i) => (
-				<circle key={`in-${i}`} cx={inputX} cy={y} r={4} fill="#94a3b8" />
+				<g key={`in-${i}`}>
+					<circle
+						cx={inputX}
+						cy={y}
+						r={actRadius(4, brain?.inputs?.[i])}
+						fill={actColor(brain?.inputs?.[i], "#94a3b8")}
+						opacity={actAlpha(brain?.inputs?.[i])}
+					/>
+					<text
+						x={inputX}
+						y={y}
+						textAnchor="middle"
+						dominantBaseline="middle"
+						fontSize={9}
+						fontWeight={700}
+						fill="#0b1220"
+						stroke="#e2e8f0"
+						strokeWidth={0.9}
+						paintOrder="stroke"
+						style={{ pointerEvents: "none", userSelect: "none" }}
+					>
+						{inputLabels[i] ?? String(i + 1)}
+					</text>
+				</g>
 			))}
 			{hiddenXs.map((x, l) =>
-				hiddenYs.map((y, h) => <circle key={`h-${l}-${h}`} cx={x} cy={y} r={4} fill="#e2e8f0" />),
+				hiddenYs.map((y, h) => (
+					<circle
+						key={`h-${l}-${h}`}
+						cx={x}
+						cy={y}
+						r={actRadius(4, brain?.hidden?.[l]?.[h])}
+						fill={actColor(brain?.hidden?.[l]?.[h], "#e2e8f0")}
+						opacity={actAlpha(brain?.hidden?.[l]?.[h])}
+					/>
+				)),
 			)}
 			{outputYs.map((y, o) => (
-				<circle key={`out-${o}`} cx={outputX} cy={y} r={5} fill="#facc15" />
+				<g key={`out-${o}`}>
+					<circle
+						cx={outputX}
+						cy={y}
+						r={actRadius(5, brain?.outputs?.[o])}
+						fill={actColor(brain?.outputs?.[o], "#facc15")}
+						opacity={actAlpha(brain?.outputs?.[o])}
+					/>
+					<text
+						x={outputX}
+						y={y}
+						textAnchor="middle"
+						dominantBaseline="middle"
+						fontSize={10}
+						fontWeight={800}
+						fill="#0b1220"
+						stroke="#e2e8f0"
+						strokeWidth={1.0}
+						paintOrder="stroke"
+						style={{ pointerEvents: "none", userSelect: "none" }}
+					>
+						{outputLabels[o] ?? String(o + 1)}
+					</text>
+				</g>
 			))}
 		</svg>
 	);
