@@ -153,7 +153,7 @@
 .controls-panel {
   position: fixed;
   top: 62px;
-  left: 14px;
+  right: 14px;
   z-index: 50;
   width: min(320px, calc(100vw - 28px));
   max-height: calc(100vh - 76px);
@@ -161,7 +161,24 @@
   padding: 14px;
   border-radius: 12px;
   border: 1px solid rgba(148, 163, 184, 0.35);
-  background: rgba(15, 23, 42, 0.9);
+  background: rgba(15, 23, 42, 0.7);
+  color: #e2e8f0;
+  backdrop-filter: blur(6px);
+}
+
+/* Selected creature (top-left) */
+.selected-panel {
+  position: fixed;
+  top: 62px;
+  left: 14px;
+  z-index: 50;
+  width: min(360px, calc(100vw - 28px));
+  max-height: calc(100vh - 76px);
+  overflow: auto;
+  padding: 14px;
+  border-radius: 12px;
+  border: 1px solid rgba(148, 163, 184, 0.35);
+  background: rgba(15, 23, 42, 0.7);
   color: #e2e8f0;
   backdrop-filter: blur(6px);
 }

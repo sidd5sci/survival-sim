@@ -38,6 +38,10 @@ type Agent = {
 	foodsEaten: number;
 	firstFoodTime: number | null;
 	minFoodDistance: number;
+	// Maze metrics for fitness shaping.
+	bestFoodDistance: number;
+	uniqueCellsVisited: number;
+	visitedCellsMask: Uint8Array;
 	collisions: number;
 	fitness: number;
 	// DNA: inherited genome encoding topology (hiddenSize), connection masks, and weights/biases.
@@ -123,7 +127,7 @@ const ENERGY_DRAIN_ACCEL_PER_UNIT = 0.015;
 const COLLISION_ENERGY_LOSS = 0.01;
 
 const LAZY_DISTANCE_THRESHOLD = 10;
-const LAZY_FITNESS_PENALTY_PER_SEC = 0.01;
+const LAZY_FITNESS_PENALTY_PER_SEC = 0.05;
 
 const START_CLEAR_RADIUS = 6;
 
@@ -138,6 +142,59 @@ const CROSSOVER_PARENT_POOL_SIZE = 10;
 const VISION_FOV_DEG = 120;
 const VISION_HALF_FOV_RAD = (VISION_FOV_DEG * Math.PI) / 360;
 const VISION_COS_THRESHOLD = Math.cos(VISION_HALF_FOV_RAD);
+
+type MazeMeta = {
+	min: number;
+	max: number;
+	usableSize: number;
+	gridW: number;
+	gridH: number;
+	tileSizeX: number;
+	tileSizeZ: number;
+	originX: number;
+	originZ: number;
+};
+
+function getMazeMeta(): MazeMeta {
+	const padding = 0;
+	const min = -HALF + padding;
+	const max = HALF - padding;
+	const usableSize = max - min;
+
+	// Choose maze density first, then fit tiles exactly into the world.
+	const desiredTileSize = 6;
+
+	let gridW = Math.floor(usableSize / desiredTileSize);
+	let gridH = Math.floor(usableSize / desiredTileSize);
+	gridW = Math.max(5, gridW);
+	gridH = Math.max(5, gridH);
+	if (gridW % 2 === 0) gridW -= 1;
+	if (gridH % 2 === 0) gridH -= 1;
+
+	const tileSizeX = usableSize / gridW;
+	const tileSizeZ = usableSize / gridH;
+
+	return {
+		min,
+		max,
+		usableSize,
+		gridW,
+		gridH,
+		tileSizeX,
+		tileSizeZ,
+		originX: min,
+		originZ: min,
+	};
+}
+
+function mazeCellIndex(pos: Vec2): number {
+	const meta = getMazeMeta();
+	const gx = Math.floor((pos.x - meta.originX) / meta.tileSizeX);
+	const gz = Math.floor((pos.z - meta.originZ) / meta.tileSizeZ);
+	const clampedGX = clamp(gx, 0, meta.gridW - 1);
+	const clampedGZ = clamp(gz, 0, meta.gridH - 1);
+	return clampedGZ * meta.gridW + clampedGX;
+}
 
 function clamp(v: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, v));
@@ -186,30 +243,8 @@ function isSavedSim3GenomesV1(v: any): v is SavedSim3GenomesV1 {
 }
 
 function createMazeWorld(): { obstacles: Obstacle[]; openCells: Vec2[] } {
-	const padding = 0;
-	const min = -HALF + padding;
-	const max = HALF - padding;
-	const usableSize = max - min;
-
-	// Choose maze density first, then fit tiles exactly into the world.
-	const desiredTileSize = 6;
-
-	let gridW = Math.floor(usableSize / desiredTileSize);
-	let gridH = Math.floor(usableSize / desiredTileSize);
-
-	gridW = Math.max(5, gridW);
-	gridH = Math.max(5, gridH);
-
-	// Force odd dimensions so DFS-on-odd-cells behaves well.
-	if (gridW % 2 === 0) gridW -= 1;
-	if (gridH % 2 === 0) gridH -= 1;
-
-	// IMPORTANT: fit exactly to bounds so no extra thick strip on top/right.
-	const tileSizeX = usableSize / gridW;
-	const tileSizeZ = usableSize / gridH;
-
-	const originX = min;
-	const originZ = min;
+	const meta = getMazeMeta();
+	const { gridW, gridH, tileSizeX, tileSizeZ, originX, originZ } = meta;
 
 	const start = { x: -HALF + 8, z: -HALF + 8 };
 
@@ -644,6 +679,10 @@ function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
 	const safeGenome = ensureGenomeInputShape(genome);
 	const spawnX = start.x + rand(-0.8, 0.8);
 	const spawnZ = start.z + rand(-0.8, 0.8);
+	const meta = getMazeMeta();
+	const visitedCellsMask = new Uint8Array(meta.gridW * meta.gridH);
+	const startCell = mazeCellIndex({ x: spawnX, z: spawnZ });
+	visitedCellsMask[startCell] = 1;
 	return {
 		id: randomId("agent"),
 		spawnX,
@@ -660,6 +699,9 @@ function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
 		foodsEaten: 0,
 		firstFoodTime: null,
 		minFoodDistance: nearestFoodDistance(start, foods),
+		bestFoodDistance: nearestFoodDistance(start, foods),
+		uniqueCellsVisited: 1,
+		visitedCellsMask,
 		collisions: 0,
 		fitness: 100,
 		genome: safeGenome,
@@ -679,6 +721,8 @@ function createInitialState(settings: EvoSettings, seedGenomes?: BrainGenome[]):
 	const agents: Agent[] = [];
 	for (const g of seeds) agents.push(createAgent(start, foods, cloneGenome(g)));
 	while (agents.length < settings.population) agents.push(createAgent(start, foods, createRandomGenome()));
+	const generationSeconds = clamp(Math.round(settings.generationSeconds), 20, 60 * 60);
+	for (const a of agents) a.fitness = computeFitness(a, 0, generationSeconds);
 
 	return {
 		generation: 1,
@@ -914,29 +958,36 @@ function learnGenome(genome: BrainGenome, inputs: number[], hiddenLayers: number
 }
 
 function computeFitness(agent: Agent, elapsed: number, generationSeconds: number): number {
-	// Fitness is strictly 0..100.
-	// Requirement: starting fitness is 100, and penalties reduce fitness.
-	const base = 100;
-	// Penalties (reduce fitness)
-	const collisionPenalty = clamp(agent.collisions * 0.6, 0, 60);
-	const energyPenalty = clamp((START_ENERGY - agent.energy) / Math.max(1, START_ENERGY), 0, 1) * 25;
-	const timeRef = agent.firstFoodTime ?? elapsed;
-	const timePenalty = clamp(timeRef / Math.max(1, generationSeconds), 0, 1) * 20;
-	// Laziness: apply 0.01 fitness penalty per second while displacement < 10 units.
-	const lazyPenalty = clamp(agent.lazySeconds, 0, generationSeconds) * LAZY_FITNESS_PENALTY_PER_SEC;
+	// Base score
+	let fitness = 0;
 
-	// Bonuses (can recover fitness, but we still clamp to 100)
-	const fruitsBonus = clamp(agent.foodsEaten / Math.max(1, FOOD_COUNT), 0, 1) * 40;
-	const energyBonus = clamp((agent.energy - START_ENERGY) / Math.max(1, MAX_ENERGY - START_ENERGY), 0, 1) * 15;
-	let speedBonus = 0;
-	if (agent.foodsEaten > 0) {
-		const rate = agent.foodsEaten / Math.max(0.0001, elapsed);
-		const targetRate = FOOD_COUNT / Math.max(1, generationSeconds);
-		const rate01 = clamp(rate / Math.max(0.0001, targetRate), 0, 1);
-		speedBonus = rate01 * 15;
+	// 1. Main objective: eating food
+	fitness += agent.foodsEaten * 40;
+
+	// 2. Reward early success
+	if (agent.firstFoodTime != null) {
+		const early01 = 1 - clamp(agent.firstFoodTime / Math.max(1, generationSeconds), 0, 1);
+		fitness += early01 * 20;
 	}
 
-	return clamp(base - collisionPenalty - energyPenalty - timePenalty - lazyPenalty + fruitsBonus + energyBonus + speedBonus, 0, 100);
+	// 3. Reward exploration (distinct maze cells visited)
+	fitness += Math.min(agent.uniqueCellsVisited * 0.12, 20);
+
+	// 4. Reward progress toward food even if not reached
+	const maxRef = HALF * 2;
+	const progress01 = 1 - clamp(agent.bestFoodDistance / Math.max(1, maxRef), 0, 1);
+	fitness += progress01 * 20;
+
+	// 5. Small reward for staying alive with usable energy
+	fitness += clamp(agent.energy / Math.max(1, MAX_ENERGY), 0, 1) * 10;
+
+	// Penalties
+	// 6. Wall collisions
+	fitness -= Math.min(agent.collisions * 2.0, 30);
+	// 7. Lazy / not moving enough
+	fitness -= Math.min(agent.lazySeconds * 0.5, 20);
+
+	return Math.max(0, fitness);
 }
 
 function breedingScore(agent: Agent, generationSeconds: number): number {
@@ -982,6 +1033,8 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	const initialNearest = nearestFoodDistance(start, foods);
 	for (const agent of nextAgents) {
 		agent.minFoodDistance = initialNearest;
+		agent.bestFoodDistance = initialNearest;
+		agent.fitness = computeFitness(agent, 0, generationSeconds);
 	}
 
 	return {
@@ -1106,6 +1159,16 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 		}
 
 		const minFoodDistance = Math.min(agent.minFoodDistance, nearestFoodDistance({ x, z }, prev.foods));
+		const bestFoodDistance = Math.min(agent.bestFoodDistance, minFoodDistance);
+
+		let uniqueCellsVisited = agent.uniqueCellsVisited;
+		let visitedCellsMask = agent.visitedCellsMask;
+		const cell = mazeCellIndex({ x, z });
+		if (visitedCellsMask[cell] === 0) {
+			visitedCellsMask = new Uint8Array(visitedCellsMask);
+			visitedCellsMask[cell] = 1;
+			uniqueCellsVisited += 1;
+		}
 		// Reward signal for learning: progress toward food and successful eating.
 		const foodsEatenDelta = foodsEaten - agent.foodsEaten;
 		const distDelta = agent.minFoodDistance - minFoodDistance;
@@ -1134,6 +1197,9 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 			firstFoodTime,
 			eatenMask,
 			minFoodDistance,
+			bestFoodDistance,
+			uniqueCellsVisited,
+			visitedCellsMask,
 			fitness: 0,
 			genome: nextGenome,
 			brain: {
@@ -1925,6 +1991,36 @@ export default function NeuralVisionSim3D() {
 				onAddFood={addFoodAt}
 				onAddObstacle={addObstacleAt}
 			/>
+			{selectedAgent ? (
+				<aside className="selected-panel">
+					<Card className="bg-transparent border-0 shadow-none">
+						<div className="controls-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+							<span>Selected</span>
+							<Badge variant="secondary">{selectedAgent.id.slice(0, 8)}</Badge>
+						</div>
+						<CardContent className="space-y-3">
+							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-1">
+								<div>
+									Fitness: <strong>{selectedAgent.fitness.toFixed(1)}</strong>
+								</div>
+								<div>
+									Energy: <strong>{selectedAgent.energy.toFixed(1)}</strong> / {MAX_ENERGY}
+								</div>
+								<div>
+									Eaten: <strong>{selectedAgent.foodsEaten}</strong> · Collisions: <strong>{selectedAgent.collisions}</strong>
+								</div>
+								<div>
+									Cells: <strong>{selectedAgent.uniqueCellsVisited}</strong> · Best food dist: <strong>{selectedAgent.bestFoodDistance.toFixed(2)}</strong>
+								</div>
+								<div className="text-xs text-slate-300">
+									Hidden layers: {selectedAgent.genome.hiddenLayers} · Neurons/layer: {selectedAgent.genome.hiddenSize}
+								</div>
+							</div>
+							<NeuralNetGraph genome={selectedAgent.genome} brain={selectedAgent.brain} />
+						</CardContent>
+					</Card>
+				</aside>
+			) : null}
 			<aside className="controls-panel">
 				<Card className="bg-transparent border-0 shadow-none">
 					<div className="controls-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -2039,32 +2135,6 @@ export default function NeuralVisionSim3D() {
 									Save downloads a JSON file. Loading a JSON file restarts the sim seeded with those genomes.
 								</div>
 								{genomeLoadError ? <div className="text-xs text-red-300">{genomeLoadError}</div> : null}
-							</div>
-
-							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-2">
-								<div className="font-semibold">Selected creature</div>
-								<select
-									className="w-full rounded-md border border-slate-700 bg-slate-900/50 p-2 text-sm"
-									value={selectedAgent?.id ?? ""}
-									onChange={(e) => setSelectedAgentId(e.target.value)}
-								>
-									{selectableAgents.map((a) => (
-										<option key={a.id} value={a.id}>
-											{a.id.slice(0, 8)} · fit {a.fitness.toFixed(0)} · eaten {a.foodsEaten}
-										</option>
-									))}
-								</select>
-								{selectedAgent && (
-									<>
-										<div className="text-xs text-slate-300">Hidden layers: {selectedAgent.genome.hiddenLayers} · neurons/layer: {selectedAgent.genome.hiddenSize}</div>
-										<div className="text-xs text-slate-300">Energy: {selectedAgent.energy.toFixed(1)} / {MAX_ENERGY} · {selectedAgent.alive ? "Alive" : "Dead"}</div>
-										<NeuralNetGraph genome={selectedAgent.genome} brain={selectedAgent.brain} />
-										{/* <div className="text-xs text-slate-300">DNA (genome)</div>
-										<pre className="max-h-[220px] overflow-auto rounded-lg border border-slate-700 bg-slate-950/40 p-2 text-[11px] leading-snug text-slate-200">
-											{JSON.stringify(selectedAgent.genome, null, 2)}
-										</pre> */}
-									</>
-								)}
 							</div>
 
 							<div className="rounded-xl border border-slate-700 p-3 text-xs text-slate-300 leading-relaxed">
