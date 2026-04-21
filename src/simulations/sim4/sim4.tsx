@@ -1511,7 +1511,8 @@ function BabylonWorld({
 		const pathMat = new BABYLON.StandardMaterial("pathMat", scene);
 		pathMat.emissiveColor = BABYLON.Color3.FromHexString("#38bdf8");
 		pathMat.diffuseColor = BABYLON.Color3.FromHexString("#0ea5e9");
-		pathMat.alpha = 0.7;
+		// 70% transparent
+		pathMat.alpha = 0.2;
 		pathMat.specularColor = BABYLON.Color3.Black();
 
 		const obstacleMat = new BABYLON.StandardMaterial("obstacleMat", scene);
