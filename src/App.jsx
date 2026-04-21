@@ -2,7 +2,8 @@ import { Link, Navigate, Route, Routes, useNavigate, useParams } from 'react-rou
 import SurvivalSim3D from './simulations/sim1/sim.tsx'
 import GeneticTrianglesSim3D from './simulations/sim2/sim2.tsx'
 import NeuralVisionSim3D from './simulations/sim3/sim3.tsx'
-import CityEscapeSim3D from './simulations/sim4/sim4.tsx'
+import MazeNeuralVisionSim3D from './simulations/sim4/sim4.tsx'
+import CityEscapeSim3D from './simulations/sim5/sim5.tsx'
 import './App.css'
 
 const simulations = [
@@ -28,11 +29,18 @@ const simulations = [
 		docsPath: '/docs/sim3-neural-vision-ga.md',
   },
   {
+    id: 'maze-neural-vision-ga-3d',
+    title: 'Maze Neural Vision GA 3D',
+    description: 'Like Sim 3, but the world is a maze and fruits are spread across reachable corridors. Includes quick placement shortcuts (F/O).',
+    status: 'Ready',
+		docsPath: '/docs/sim4-maze-neural-vision-ga.md',
+  },
+  {
     id: 'city-escape-ai-3d',
     title: 'City Escape AI 3D',
     description: 'One articulated bot must escape a procedural city while enemies chase; vision is sent as a low-res matrix to a configurable AI endpoint.',
     status: 'MVP',
-		docsPath: '/docs/sim4-survival.md',
+		docsPath: '/docs/sim5-city-escape-ai.md',
   },
 ]
 
@@ -75,6 +83,7 @@ function SimulationView() {
   let simulation = <SurvivalSim3D />
   if (simulationId === 'genetic-triangles-3d') simulation = <GeneticTrianglesSim3D />
   if (simulationId === 'neural-vision-ga-3d') simulation = <NeuralVisionSim3D />
+  if (simulationId === 'maze-neural-vision-ga-3d') simulation = <MazeNeuralVisionSim3D />
   if (simulationId === 'city-escape-ai-3d') simulation = <CityEscapeSim3D />
 
   const validIds = new Set(simulations.map((s) => s.id))
