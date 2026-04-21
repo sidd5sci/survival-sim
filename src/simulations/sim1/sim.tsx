@@ -39,6 +39,26 @@ function repelFromObstacles(entity, obstacles, radius = 1.2) {
       rz += (dz / d) * strength;
     }
   }
+
+  // Boundary wall repel so bots/enemies avoid edges like obstacles.
+  const bound = HALF - radius;
+  const margin = 3.5;
+  if (entity.x > bound - margin) {
+    const t = clamp((entity.x - (bound - margin)) / margin, 0, 1);
+    rx += -t * 2.2;
+  }
+  if (entity.x < -bound + margin) {
+    const t = clamp(((-bound + margin) - entity.x) / margin, 0, 1);
+    rx += t * 2.2;
+  }
+  if (entity.z > bound - margin) {
+    const t = clamp((entity.z - (bound - margin)) / margin, 0, 1);
+    rz += -t * 2.2;
+  }
+  if (entity.z < -bound + margin) {
+    const t = clamp(((-bound + margin) - entity.z) / margin, 0, 1);
+    rz += t * 2.2;
+  }
   return { x: rx, z: rz };
 }
 
@@ -139,7 +159,7 @@ function useSimulation() {
 
   const randomize = () => {
     const nextObstacles = [];
-    for (let i = 0; i < 8; i++) {
+    for (let i = 0; i < 14; i++) {
       const p = randomFreePosition(nextObstacles, [], [], 3);
       nextObstacles.push({ id: crypto.randomUUID(), x: p.x, z: p.z, size: 1 + Math.random() * 2.2 });
     }
@@ -410,6 +430,30 @@ function BabylonWorld({ sim }) {
       scene,
     );
     boundary.color = BABYLON.Color3.White();
+
+    // Visible boundary walls (treat edges like obstacles)
+    const wallMat = new BABYLON.StandardMaterial("wallMat", scene);
+    wallMat.diffuseColor = BABYLON.Color3.FromHexString("#334155");
+    wallMat.emissiveColor = BABYLON.Color3.FromHexString("#0b1220");
+    const wallH = 3.2;
+    const wallT = 0.8;
+    const wallY = wallH / 2;
+    const wallN = BABYLON.MeshBuilder.CreateBox("wallN", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+    wallN.position.set(0, wallY, -HALF);
+    wallN.isPickable = false;
+    wallN.material = wallMat;
+    const wallS = BABYLON.MeshBuilder.CreateBox("wallS", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+    wallS.position.set(0, wallY, HALF);
+    wallS.isPickable = false;
+    wallS.material = wallMat;
+    const wallW = BABYLON.MeshBuilder.CreateBox("wallW", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+    wallW.position.set(-HALF, wallY, 0);
+    wallW.isPickable = false;
+    wallW.material = wallMat;
+    const wallE = BABYLON.MeshBuilder.CreateBox("wallE", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+    wallE.position.set(HALF, wallY, 0);
+    wallE.isPickable = false;
+    wallE.material = wallMat;
 
     const obstacleMat = new BABYLON.StandardMaterial("obstacleMat", scene);
     obstacleMat.diffuseColor = BABYLON.Color3.FromHexString("#6b4f2a");

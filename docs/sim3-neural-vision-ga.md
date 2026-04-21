@@ -15,6 +15,10 @@ This sim adds:
 - Food spheres.
 - Triangle creatures that rotate to face their heading.
 
+Notes:
+- Obstacles are distributed across the full world (all directions).
+- The world boundary has visible walls and creatures treat the boundary as an obstacle.
+
 ## Interaction
 - **Click a creature** to select it.
 - When selected:
@@ -85,6 +89,10 @@ The graph shown in the UI renders all hidden layers and their inter-layer connec
 ## Collision behavior
 - Creatures are prevented from passing through obstacles by sub-stepped integration and penetration resolution against obstacle circles (obstacle size + agent radius) in the XZ plane.
 
+Boundary behavior:
+- The world boundary behaves like a wall. Hitting/clamping at the boundary counts as a collision.
+- For perception, the boundary is treated as a “virtual obstacle” so creatures learn to avoid edges.
+
 ## Fitness (high level)
 Fitness rewards:
 - Food eaten
@@ -98,3 +106,15 @@ Fitness penalties:
 ## Notes
 - The GA runs for a fixed generation duration and then breeds a new population.
 - Optional learning can nudge weights during a generation; that change is written back to DNA.
+
+### Parent selection (breeding)
+Parents for crossover are selected with a weighted score that rewards:
+- High fitness
+- High remaining energy
+- Eating the first food quickly (lower `firstFoodTime`)
+
+This makes the next generation converge toward creatures that are both effective and efficient.
+
+### Crossover-time mutation
+When crossover happens, the child genome also receives a small additional “jitter” on some weights/biases.
+This reduces the chance that crossover produces an offspring identical to a parent.

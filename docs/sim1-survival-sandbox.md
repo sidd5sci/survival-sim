@@ -10,6 +10,9 @@ A BabylonJS sandbox where you can place **obstacles**, **enemies**, and **food**
 - Enemies.
 - A single controllable “bot” entity.
 
+Notes:
+- The world has visible boundary walls and the edges behave like obstacles.
+
 ## Controls (left panel)
 - **Placement**: choose what you place with clicks.
   - `Obstacle` / `Enemy` / `Food`

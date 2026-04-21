@@ -1,6 +1,6 @@
 # survival-sim
 
-A React + Vite simulation hub with three BabylonJS-based simulations.
+A React + Vite simulation hub with four BabylonJS-based simulations.
 
 ## Run
 

@@ -53,7 +53,7 @@ const DRAG = 0.9;
 const GENE_STEP_SECONDS = 0.33;
 const GENERATION_SECONDS = 300;
 const FOOD_COUNT = 8;
-const OBSTACLE_COUNT = 12;
+const OBSTACLE_COUNT = 20;
 
 function clamp(v: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, v));
@@ -112,7 +112,7 @@ function createObstacles(): Obstacle[] {
 	for (let i = 0; i < OBSTACLE_COUNT; i += 1) {
 		obstacles.push({
 			id: randomId("obs"),
-			x: rand(-8, HALF - 6),
+			x: rand(-HALF + 8, HALF - 8),
 			z: rand(-HALF + 8, HALF - 8),
 			size: rand(1.3, 3),
 			height: rand(1.8, 4),
@@ -170,6 +170,26 @@ function obstacleRepel(pos: Vec2, obstacles: Obstacle[]): Vec2 {
 			rx += (dx / d) * push;
 			rz += (dz / d) * push;
 		}
+	}
+
+	// Boundary "wall" repel so agents treat world edges like obstacles.
+	const bound = HALF - AGENT_RADIUS;
+	const margin = 3.5;
+	if (pos.x > bound - margin) {
+		const t = clamp((pos.x - (bound - margin)) / margin, 0, 1);
+		rx += -t * 2.2;
+	}
+	if (pos.x < -bound + margin) {
+		const t = clamp(((-bound + margin) - pos.x) / margin, 0, 1);
+		rx += t * 2.2;
+	}
+	if (pos.z > bound - margin) {
+		const t = clamp((pos.z - (bound - margin)) / margin, 0, 1);
+		rz += -t * 2.2;
+	}
+	if (pos.z < -bound + margin) {
+		const t = clamp(((-bound + margin) - pos.z) / margin, 0, 1);
+		rz += t * 2.2;
 	}
 
 	return { x: rx, z: rz };
@@ -270,9 +290,12 @@ function stepSimulation(prev: SimState, dt: number, settings: GaSettings, startP
 			vz = (vz / vLen) * MAX_SPEED;
 		}
 
-		let x = clamp(agent.x + vx * dt, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
-		let z = clamp(agent.z + vz * dt, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+		const rawX = agent.x + vx * dt;
+		const rawZ = agent.z + vz * dt;
+		let x = clamp(rawX, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+		let z = clamp(rawZ, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
 		let collisions = agent.collisions;
+		if (x !== rawX || z !== rawZ) collisions += 1;
 
 		for (const obstacle of prev.obstacles) {
 			const dx = x - obstacle.x;
@@ -395,6 +418,30 @@ function BabylonWorld({ state }: { state: SimState }) {
 			scene,
 		);
 		boundary.color = BABYLON.Color3.FromHexString("#64748b");
+
+		// Visible boundary walls (treat edges like obstacles)
+		const wallMat = new BABYLON.StandardMaterial("wallMat", scene);
+		wallMat.diffuseColor = BABYLON.Color3.FromHexString("#334155");
+		wallMat.emissiveColor = BABYLON.Color3.FromHexString("#0b1220");
+		const wallH = 3.2;
+		const wallT = 0.8;
+		const wallY = wallH / 2;
+		const wallN = BABYLON.MeshBuilder.CreateBox("wallN", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+		wallN.position.set(0, wallY, -HALF);
+		wallN.isPickable = false;
+		wallN.material = wallMat;
+		const wallS = BABYLON.MeshBuilder.CreateBox("wallS", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+		wallS.position.set(0, wallY, HALF);
+		wallS.isPickable = false;
+		wallS.material = wallMat;
+		const wallW = BABYLON.MeshBuilder.CreateBox("wallW", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+		wallW.position.set(-HALF, wallY, 0);
+		wallW.isPickable = false;
+		wallW.material = wallMat;
+		const wallE = BABYLON.MeshBuilder.CreateBox("wallE", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+		wallE.position.set(HALF, wallY, 0);
+		wallE.isPickable = false;
+		wallE.material = wallMat;
 
 		const obstacleMeshes = new Map<string, BABYLON.Mesh>();
 		const foodMeshes = new Map<string, BABYLON.Mesh>();

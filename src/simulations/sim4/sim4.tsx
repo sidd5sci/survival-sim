@@ -3,7 +3,7 @@ import * as BABYLON from "babylonjs";
 import { Card, CardContent } from "../../components/ui/card";
 import { Button } from "../../components/ui/button";
 import { Slider } from "../../components/ui/slider";
-import { ensureLmStudioModelReady, lmStudioChatText, normalizeLmStudioBaseUrl } from "../../services/lmstudio";
+import { ensureLmStudioModelReady, lmStudioChatText, lmStudioResponsesToolCall, normalizeLmStudioBaseUrl } from "../../services/lmstudio";
 import { replicatePredict } from "../../services/replicate";
 
 type Vec2 = { x: number; z: number };
@@ -189,22 +189,76 @@ async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState:
 
 	const systemPrompt =
 		"Return ONLY one minified JSON object. No reasoning. No prose. No markdown.\n" +
+		"Do NOT output ``` or ```json fences. Do NOT output backticks.\n" +
+		"Output must start with { and end with }.\n" +
 		"Keys: left,right,forward,backward in [-1..1], speed in [0..1], optional booleans pick,throw,grow.\n" +
 		"Actions: pick picks nearest rock if close and hands free; throw throws held rock forward; grow increases capacity if enough energy.\n" +
 		"Goal: survive, avoid enemies, reach the green exit ring.\n" +
+        "If you are unclear where you are try to turn left or right to explore.\n" +
 		"Example: {\"left\":0,\"right\":0,\"forward\":1,\"backward\":0,\"speed\":0.8}";
 
 	const userText = JSON.stringify(compactState);
+	const safeVision = visionDataUrl && visionDataUrl.length > 0 ? visionDataUrl : null;
+
+	// Prefer tool-calling via OpenAI-compatible /v1/responses to guarantee structured JSON args.
+	const tool = {
+		type: "function" as const,
+		name: "act",
+		description: "Choose the next movement/action for the bot.",
+		parameters: {
+			type: "object",
+			additionalProperties: false,
+			properties: {
+				left: { type: "number" },
+				right: { type: "number" },
+				forward: { type: "number" },
+				backward: { type: "number" },
+				speed: { type: "number" },
+				pick: { type: "boolean" },
+				throw: { type: "boolean" },
+				grow: { type: "boolean" },
+			},
+			required: ["left", "right", "forward", "backward", "speed"],
+		},
+	};
+
+	try {
+		const toolCall = await lmStudioResponsesToolCall({
+			lmStudioBaseUrl,
+			model: modelKey,
+			systemPrompt,
+			userText,
+			visionDataUrl: safeVision,
+			tools: [tool],
+			toolChoice: { type: "function", name: "act" },
+			maxOutputTokens: 90,
+			temperature: 0,
+		});
+		if (toolCall?.name === "act") {
+			let args: any = toolCall.args;
+			if (typeof args === "string") {
+				try {
+					args = JSON.parse(args);
+				} catch {
+					// keep as-is
+				}
+			}
+			return sanitizeAction(args);
+		}
+	} catch {
+		// fall through to text-based fallback
+	}
+
+	// Fallback: ask for raw JSON in text.
 	const content = await lmStudioChatText({
 		lmStudioBaseUrl,
 		model: modelKey,
 		systemPrompt,
 		userText,
-		visionDataUrl: visionDataUrl ?? null,
+		visionDataUrl: safeVision,
 		maxOutputTokens: 90,
 		temperature: 0,
 	});
-
 	let actionObj: any = null;
 	try {
 		actionObj = extractJsonObject(String(content));
@@ -284,6 +338,30 @@ function BabylonWorld({
 			scene,
 		);
 		boundary.color = BABYLON.Color3.FromHexString("#64748b");
+
+		// Visible boundary walls (so the vision model can see the world edge)
+		const wallMat = new BABYLON.StandardMaterial("wallMat", scene);
+		wallMat.diffuseColor = BABYLON.Color3.FromHexString("#334155");
+		wallMat.emissiveColor = BABYLON.Color3.FromHexString("#0b1220");
+		const wallH = 3.6;
+		const wallT = 0.9;
+		const wallY = wallH / 2;
+		const wallN = BABYLON.MeshBuilder.CreateBox("wallN", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+		wallN.position.set(0, wallY, -HALF);
+		wallN.isPickable = false;
+		wallN.material = wallMat;
+		const wallS = BABYLON.MeshBuilder.CreateBox("wallS", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+		wallS.position.set(0, wallY, HALF);
+		wallS.isPickable = false;
+		wallS.material = wallMat;
+		const wallW = BABYLON.MeshBuilder.CreateBox("wallW", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+		wallW.position.set(-HALF, wallY, 0);
+		wallW.isPickable = false;
+		wallW.material = wallMat;
+		const wallE = BABYLON.MeshBuilder.CreateBox("wallE", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+		wallE.position.set(HALF, wallY, 0);
+		wallE.isPickable = false;
+		wallE.material = wallMat;
 
 		// Exit marker
 		const exit = BABYLON.MeshBuilder.CreateTorus("exit", { diameter: EXIT_RADIUS * 2.2, thickness: 0.22, tessellation: 48 }, scene);
@@ -479,7 +557,7 @@ function BabylonWorld({
 		});
 
 		// Vision rendering should include relevant meshes
-		visionTarget.renderList = [ground, ...Array.from(buildingMeshes.values()), torso, head];
+		visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, ...Array.from(buildingMeshes.values()), torso, head];
 		// Enemies/rocks are added dynamically via sync functions; we will refresh renderList periodically.
 		let lastRenderListRefresh = 0;
 
@@ -635,6 +713,7 @@ function BabylonWorld({
 
 		let lastUiAt = 0;
 		let lastT = performance.now();
+		let lastAiSentImage = false;
 
 		// Local AI bootstrap (load/download model once, then run inference calls without re-checking every tick).
 		const localBootstrap = {
@@ -706,7 +785,7 @@ function BabylonWorld({
 			// Refresh vision render list occasionally.
 			if (now - lastRenderListRefresh > 800) {
 				lastRenderListRefresh = now;
-				visionTarget.renderList = [ground, ...Array.from(buildingMeshes.values()), torso, head, ...Array.from(enemyMeshes.values()), ...Array.from(rockMeshes.values())];
+				visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, ...Array.from(buildingMeshes.values()), torso, head, ...Array.from(enemyMeshes.values()), ...Array.from(rockMeshes.values())];
 			}
 
 			const s = settingsRef.current;
@@ -721,6 +800,7 @@ function BabylonWorld({
 						try {
 							const cap = await captureVision(Math.round(clamp(s.visionResolution, 16, 96)));
 							if (cap?.dataUrl) onVisionPreviewRef.current(cap.dataUrl);
+							const visionUrl = cap?.dataUrl && cap.dataUrl.length > 0 ? cap.dataUrl : null;
 							const compactState = computeCompactState();
 
 							let action: AiAction;
@@ -728,11 +808,12 @@ function BabylonWorld({
 								if (!localBootstrap.ready) {
 									action = defaultFallbackAction(bot);
 								} else {
+									lastAiSentImage = Boolean(visionUrl);
 									action = await callLocalAi(
 										s.localEndpointUrl.trim(),
 										s.localModelName.trim() || "google/gemma-4-e2b",
 									compactState,
-									cap?.dataUrl ?? null,
+									visionUrl,
 								);
 								}
 							} else if (s.aiProvider === "replicate" && s.replicateApiToken.trim() && s.replicateModel.trim()) {
@@ -955,6 +1036,7 @@ function BabylonWorld({
 				const aliveEnemies = enemies.filter((e) => e.alive).length;
 				const activeRocks = rocks.filter((r) => r.active).length;
 				const localHint = settingsRef.current.aiProvider === "local" && !localBootstrap.ready ? ` (${localBootstrap.status})` : "";
+				const imgHint = settingsRef.current.aiProvider === "local" ? (lastAiSentImage ? " [img]" : " [no-img]") : "";
 				const status = bot.escaped
 					? "Escaped!"
 					: bot.health <= 0
@@ -963,7 +1045,7 @@ function BabylonWorld({
 							? "Paused"
 							: settingsRef.current.aiProvider === "none"
 								? "No AI configured (fallback running)"
-								: `Running${localHint}`;
+								: `Running${localHint}${imgHint}`;
 
 				onUi({
 					health: bot.health,

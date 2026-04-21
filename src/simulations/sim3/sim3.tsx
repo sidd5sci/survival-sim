@@ -70,13 +70,26 @@ type SimState = {
 	bestEverFitness: number;
 };
 
+type SavedSim3GenomesV1 = {
+	version: 1;
+	sim: "sim3";
+	createdAt: string;
+	top: Array<{
+		fitness: number;
+		energy: number;
+		foodsEaten: number;
+		firstFoodTime: number | null;
+		genome: BrainGenome;
+	}>;
+};
+
 const WORLD_SIZE = 84;
 const HALF = WORLD_SIZE / 2;
 const AGENT_RADIUS = 0.35;
 const FOOD_RADIUS = 0.6;
 const GENERATION_SECONDS = 300;
 const FOOD_COUNT = 8;
-const OBSTACLE_COUNT = 13;
+const OBSTACLE_COUNT = 30;
 const DEFAULT_VISION_RADIUS = 5;
 const INPUTS = 8;
 const OUTPUTS = 5;
@@ -98,6 +111,17 @@ const ENERGY_DRAIN_BASE_PER_SEC = 0.04;
 const ENERGY_DRAIN_SPEED_PER_UNIT = 0.06;
 const ENERGY_DRAIN_ACCEL_PER_UNIT = 0.015;
 const DEAD_FITNESS_PENALTY = 2000;
+
+// Add a small amount of additional exploration specifically during crossover so
+// offspring don't frequently end up identical to a parent (especially with low mutation).
+const CROSSOVER_JITTER_RATE = 0.035;
+const CROSSOVER_JITTER_STRENGTH = 0.22;
+
+// When selecting parents for crossover, also reward higher remaining energy.
+// This nudges evolution toward agents that not only progress/eat, but also survive efficiently.
+const BREEDING_ENERGY_BONUS = 2600;
+// Also reward eating the first food quickly (lower time is better).
+const BREEDING_FIRST_FOOD_BONUS = 2200;
 
 const VISION_FOV_DEG = 120;
 const VISION_HALF_FOV_RAD = (VISION_FOV_DEG * Math.PI) / 360;
@@ -126,6 +150,29 @@ function randomId(prefix: string): string {
 	return `${prefix}-${crypto.randomUUID()}`;
 }
 
+function downloadJson(filename: string, data: unknown) {
+	const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+	const url = URL.createObjectURL(blob);
+	const a = document.createElement("a");
+	a.href = url;
+	a.download = filename;
+	document.body.appendChild(a);
+	a.click();
+	a.remove();
+	URL.revokeObjectURL(url);
+}
+
+function isSavedSim3GenomesV1(v: any): v is SavedSim3GenomesV1 {
+	return (
+		v &&
+		v.version === 1 &&
+		v.sim === "sim3" &&
+		typeof v.createdAt === "string" &&
+		Array.isArray(v.top) &&
+		v.top.every((e: any) => e && typeof e === "object" && e.genome && typeof e.genome === "object")
+	);
+}
+
 function createFoods(): Food[] {
 	const foods: Food[] = [];
 	for (let i = 0; i < FOOD_COUNT; i += 1) {
@@ -143,7 +190,7 @@ function createObstacles(): Obstacle[] {
 	for (let i = 0; i < OBSTACLE_COUNT; i += 1) {
 		obstacles.push({
 			id: randomId("obs"),
-			x: rand(-10, HALF - 6),
+			x: rand(-HALF + 8, HALF - 8),
 			z: rand(-HALF + 8, HALF - 8),
 			size: rand(1.2, 2.8),
 			height: rand(1.5, 4.2),
@@ -164,6 +211,64 @@ function randomWeight(): number {
 
 function randomMask(): number {
 	return Math.random() < 0.7 ? 1 : 0;
+}
+
+function applyCrossoverJitter(genome: BrainGenome): BrainGenome {
+	let changed = 0;
+	const jitter = (v: number) => clamp(v + rand(-CROSSOVER_JITTER_STRENGTH, CROSSOVER_JITTER_STRENGTH), -3, 3);
+
+	for (let i = 0; i < INPUTS; i += 1) {
+		for (let h = 0; h < genome.hiddenSize; h += 1) {
+			if (Math.random() < CROSSOVER_JITTER_RATE) {
+				genome.inputHiddenWeights[i][h] = jitter(genome.inputHiddenWeights[i][h]);
+				changed += 1;
+			}
+		}
+	}
+
+	for (let l = 0; l < genome.hiddenLayers; l += 1) {
+		for (let h = 0; h < genome.hiddenSize; h += 1) {
+			if (Math.random() < CROSSOVER_JITTER_RATE) {
+				genome.hiddenBiases[l][h] = jitter(genome.hiddenBiases[l][h]);
+				changed += 1;
+			}
+		}
+	}
+
+	for (let l = 0; l < Math.max(0, genome.hiddenLayers - 1); l += 1) {
+		for (let i = 0; i < genome.hiddenSize; i += 1) {
+			for (let h = 0; h < genome.hiddenSize; h += 1) {
+				if (Math.random() < CROSSOVER_JITTER_RATE) {
+					genome.hiddenHiddenWeights[l][i][h] = jitter(genome.hiddenHiddenWeights[l][i][h]);
+					changed += 1;
+				}
+			}
+		}
+	}
+
+	for (let h = 0; h < genome.hiddenSize; h += 1) {
+		for (let o = 0; o < OUTPUTS; o += 1) {
+			if (Math.random() < CROSSOVER_JITTER_RATE) {
+				genome.hiddenOutputWeights[h][o] = jitter(genome.hiddenOutputWeights[h][o]);
+				changed += 1;
+			}
+		}
+	}
+
+	for (let o = 0; o < OUTPUTS; o += 1) {
+		if (Math.random() < CROSSOVER_JITTER_RATE) {
+			genome.outputBiases[o] = jitter(genome.outputBiases[o]);
+			changed += 1;
+		}
+	}
+
+	// Guarantee at least one change on crossover to avoid exact clones.
+	if (changed === 0) {
+		const o = Math.floor(rand(0, OUTPUTS));
+		genome.outputBiases[o] = jitter(genome.outputBiases[o]);
+	}
+
+	return genome;
 }
 
 function createRandomGenome(hiddenSize = Math.floor(rand(3, 8)), hiddenLayers = Math.floor(rand(1, 3))): BrainGenome {
@@ -361,7 +466,7 @@ function crossoverGenomes(a: BrainGenome, b: BrainGenome, crossoverRate: number)
 	for (let o = 0; o < OUTPUTS; o += 1) {
 		child.outputBiases[o] = Math.random() < 0.5 ? ra.outputBiases[o] : rb.outputBiases[o];
 	}
-	return child;
+	return applyCrossoverJitter(child);
 }
 
 function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
@@ -390,11 +495,14 @@ function createAgent(start: Vec2, foods: Food[], genome: BrainGenome): Agent {
 	};
 }
 
-function createInitialState(settings: EvoSettings): SimState {
+function createInitialState(settings: EvoSettings, seedGenomes?: BrainGenome[]): SimState {
 	const foods = createFoods();
 	const obstacles = createObstacles();
 	const start = { x: -HALF + 8, z: -HALF + 8 };
-	const agents = Array.from({ length: settings.population }, () => createAgent(start, foods, createRandomGenome()));
+	const seeds = (seedGenomes ?? []).filter(Boolean).slice(0, settings.population);
+	const agents: Agent[] = [];
+	for (const g of seeds) agents.push(createAgent(start, foods, cloneGenome(g)));
+	while (agents.length < settings.population) agents.push(createAgent(start, foods, createRandomGenome()));
 
 	return {
 		generation: 1,
@@ -445,6 +553,29 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], vis
 		}
 	}
 
+	// Boundary walls as a "virtual obstacle" so creatures treat edges like obstacles.
+	// We approximate the wall by the closest point on each boundary edge.
+	const wallCandidates: Vec2[] = [
+		{ x: HALF, z: clamp(agent.z, -HALF, HALF) },
+		{ x: -HALF, z: clamp(agent.z, -HALF, HALF) },
+		{ x: clamp(agent.x, -HALF, HALF), z: HALF },
+		{ x: clamp(agent.x, -HALF, HALF), z: -HALF },
+	];
+	let nearestWall: Vec2 | null = null;
+	let nearestWallDist = visionRadius + 1;
+	for (const p of wallCandidates) {
+		const d = dist(agent, p);
+		if (d > visionRadius || d >= nearestWallDist) continue;
+		const nxz = normalize(p.x - agent.x, p.z - agent.z);
+		const dot = nxz.x * hx + nxz.z * hz;
+		if (dot < VISION_COS_THRESHOLD) continue;
+		nearestWallDist = d;
+		nearestWall = p;
+	}
+
+	// Choose the closer of: real obstacle or boundary wall.
+	const useWall = nearestWall && nearestWallDist < nearestObsDist;
+
 	let foodDx = 0;
 	let foodDz = 0;
 	let foodDist = 0;
@@ -459,7 +590,13 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], vis
 	let obsDx = 0;
 	let obsDz = 0;
 	let obsDist = 0;
-	if (nearestObs) {
+	if (useWall && nearestWall) {
+		const n = normalize(nearestWall.x - agent.x, nearestWall.z - agent.z);
+		// Creature-local direction: x=right, z=forward.
+		obsDx = n.x * rx + n.z * rz;
+		obsDz = n.x * hx + n.z * hz;
+		obsDist = 1 - clamp(nearestWallDist / Math.max(visionRadius, 0.0001), 0, 1);
+	} else if (nearestObs) {
 		const n = normalize(nearestObs.x - agent.x, nearestObs.z - agent.z);
 		// Creature-local direction: x=right, z=forward.
 		obsDx = n.x * rx + n.z * rz;
@@ -593,13 +730,22 @@ function computeFitness(agent: Agent, elapsed: number, initialNearest: number): 
 	return agent.foodsEaten * 1500 + progress * 10 + speedReward * 500 + firstFoodBonus - agent.collisions * 16 - alivePenalty;
 }
 
+function breedingScore(agent: Agent): number {
+	const energy01 = clamp(agent.energy / Math.max(1, MAX_ENERGY), 0, 1);
+	const firstFood01 =
+		agent.firstFoodTime == null
+			? 0
+			: clamp((GENERATION_SECONDS - agent.firstFoodTime) / Math.max(1, GENERATION_SECONDS), 0, 1);
+	return agent.fitness + energy01 * BREEDING_ENERGY_BONUS + firstFood01 * BREEDING_FIRST_FOOD_BONUS;
+}
+
 function selectParent(pool: Agent[]): Agent {
-	const minFitness = Math.min(...pool.map((a) => a.fitness));
-	const offset = minFitness < 0 ? Math.abs(minFitness) + 1 : 1;
-	const total = pool.reduce((sum, a) => sum + a.fitness + offset, 0);
+	const minScore = Math.min(...pool.map((a) => breedingScore(a)));
+	const offset = minScore < 0 ? Math.abs(minScore) + 1 : 1;
+	const total = pool.reduce((sum, a) => sum + breedingScore(a) + offset, 0);
 	let roll = Math.random() * total;
 	for (const a of pool) {
-		roll -= a.fitness + offset;
+		roll -= breedingScore(a) + offset;
 		if (roll <= 0) return a;
 	}
 	return pool[pool.length - 1];
@@ -609,10 +755,11 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	const start = { x: -HALF + 8, z: -HALF + 8 };
 	const foods = createFoods();
 	const obstacles = createObstacles();
-	const ranked = [...state.agents].sort((a, b) => b.fitness - a.fitness);
-	const bestPrev = ranked[0]?.fitness ?? 0;
-	const eliteCount = clamp(settings.eliteCount, 1, ranked.length);
-	const elites = ranked.slice(0, eliteCount);
+	const rankedByFitness = [...state.agents].sort((a, b) => b.fitness - a.fitness);
+	const bestPrev = rankedByFitness[0]?.fitness ?? 0;
+	const eliteCount = clamp(settings.eliteCount, 1, rankedByFitness.length);
+	const elites = rankedByFitness.slice(0, eliteCount);
+	const breedingPool = [...state.agents].sort((a, b) => breedingScore(b) - breedingScore(a));
 
 	const nextAgents: Agent[] = [];
 	for (const elite of elites) {
@@ -620,8 +767,8 @@ function evolve(state: SimState, settings: EvoSettings): SimState {
 	}
 
 	while (nextAgents.length < settings.population) {
-		const parentA = selectParent(ranked);
-		const parentB = selectParent(ranked);
+		const parentA = selectParent(breedingPool);
+		const parentB = selectParent(breedingPool);
 		const crossed = crossoverGenomes(parentA.genome, parentB.genome, settings.crossoverRate);
 		const mutated = mutateGenome(crossed, settings);
 		nextAgents.push(createAgent(start, foods, mutated));
@@ -691,8 +838,11 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 				vz = (vz / speedNow) * desiredMaxSpeed;
 			}
 
-			x = clamp(x + vx * dtStep, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
-			z = clamp(z + vz * dtStep, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+			const rawX = x + vx * dtStep;
+			const rawZ = z + vz * dtStep;
+			x = clamp(rawX, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+			z = clamp(rawZ, -HALF + AGENT_RADIUS, HALF - AGENT_RADIUS);
+			if (x !== rawX || z !== rawZ) collidedThisStep = true;
 
 			for (const obstacle of prev.obstacles) {
 				const dx = x - obstacle.x;
@@ -806,11 +956,13 @@ function hslToColor3(h: number, s: number, l: number): BABYLON.Color3 {
 function BabylonWorld({
 	state,
 	visionRadius,
+	showPath,
 	selectedAgentId,
 	onSelectAgent,
 }: {
 	state: SimState;
 	visionRadius: number;
+	showPath: boolean;
 	selectedAgentId: string | null;
 	onSelectAgent: (id: string) => void;
 }) {
@@ -819,6 +971,7 @@ function BabylonWorld({
 	const selectedIdRef = useRef<string | null>(selectedAgentId);
 	const onSelectAgentRef = useRef(onSelectAgent);
 	const visionRadiusRef = useRef<number>(visionRadius);
+	const showPathRef = useRef<boolean>(showPath);
 
 	useEffect(() => {
 		stateRef.current = state;
@@ -835,6 +988,10 @@ function BabylonWorld({
 	useEffect(() => {
 		visionRadiusRef.current = visionRadius;
 	}, [visionRadius]);
+
+	useEffect(() => {
+		showPathRef.current = showPath;
+	}, [showPath]);
 
 	const createAgentTriangle = (name: string, scene: BABYLON.Scene) => {
 		// A small triangular prism pointing along +Z.
@@ -895,13 +1052,16 @@ function BabylonWorld({
 
 		const hemi = new BABYLON.HemisphericLight("ambient", new BABYLON.Vector3(0, 1, 0), scene);
 		hemi.intensity = 0.95;
+		hemi.specular = BABYLON.Color3.Black();
 		const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.5, -1, -0.4), scene);
 		sun.position = new BABYLON.Vector3(20, 24, 16);
 		sun.intensity = 1.15;
+		sun.specular = BABYLON.Color3.Black();
 
 		const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: WORLD_SIZE, height: WORLD_SIZE }, scene);
 		const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
 		groundMat.diffuseColor = BABYLON.Color3.FromHexString("#102f24");
+		groundMat.specularColor = BABYLON.Color3.Black();
 		ground.material = groundMat;
 
 		const boundary = BABYLON.MeshBuilder.CreateLines(
@@ -918,6 +1078,31 @@ function BabylonWorld({
 			scene,
 		);
 		boundary.color = BABYLON.Color3.FromHexString("#64748b");
+
+		// Visible boundary walls (agents treat edges like obstacles)
+		const wallMat = new BABYLON.StandardMaterial("wallMat", scene);
+		wallMat.diffuseColor = BABYLON.Color3.FromHexString("#334155");
+		wallMat.emissiveColor = BABYLON.Color3.FromHexString("#0b1220");
+		wallMat.specularColor = BABYLON.Color3.Black();
+		const wallH = 3.4;
+		const wallT = 0.8;
+		const wallY = wallH / 2;
+		const wallN = BABYLON.MeshBuilder.CreateBox("wallN", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+		wallN.position.set(0, wallY, -HALF);
+		wallN.isPickable = false;
+		wallN.material = wallMat;
+		const wallS = BABYLON.MeshBuilder.CreateBox("wallS", { width: WORLD_SIZE, depth: wallT, height: wallH }, scene);
+		wallS.position.set(0, wallY, HALF);
+		wallS.isPickable = false;
+		wallS.material = wallMat;
+		const wallW = BABYLON.MeshBuilder.CreateBox("wallW", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+		wallW.position.set(-HALF, wallY, 0);
+		wallW.isPickable = false;
+		wallW.material = wallMat;
+		const wallE = BABYLON.MeshBuilder.CreateBox("wallE", { width: wallT, depth: WORLD_SIZE, height: wallH }, scene);
+		wallE.position.set(HALF, wallY, 0);
+		wallE.isPickable = false;
+		wallE.material = wallMat;
 
 		const obstacleMeshes = new Map<string, BABYLON.Mesh>();
 		const foodMeshes = new Map<string, BABYLON.Mesh>();
@@ -936,6 +1121,7 @@ function BabylonWorld({
 		ringMat.emissiveColor = BABYLON.Color3.FromHexString("#38bdf8");
 		ringMat.diffuseColor = BABYLON.Color3.FromHexString("#0ea5e9");
 		ringMat.alpha = 0.55;
+		ringMat.specularColor = BABYLON.Color3.Black();
 		visionRing.material = ringMat;
 		visionRing.setEnabled(false);
 
@@ -945,12 +1131,32 @@ function BabylonWorld({
 		fovTubeMat.emissiveColor = BABYLON.Color3.FromHexString("#a78bfa");
 		fovTubeMat.diffuseColor = BABYLON.Color3.FromHexString("#7c3aed");
 		fovTubeMat.alpha = 0.85;
+		fovTubeMat.specularColor = BABYLON.Color3.Black();
+
+		// Optional trails for all creatures.
+		type PathEntry = {
+			tube: BABYLON.Mesh | null;
+			points: BABYLON.Vector3[];
+			lastPos: BABYLON.Vector3 | null;
+		};
+		const pathsByAgent = new Map<string, PathEntry>();
+		let lastPathsVisible = false;
+		const PATH_MAX_POINTS = 320;
+		const PATH_MIN_DIST = 0.35;
+		const PATH_TUBE_RADIUS = 0.055;
+		const pathMat = new BABYLON.StandardMaterial("pathMat", scene);
+		pathMat.emissiveColor = BABYLON.Color3.FromHexString("#38bdf8");
+		pathMat.diffuseColor = BABYLON.Color3.FromHexString("#0ea5e9");
+		pathMat.alpha = 0.7;
+		pathMat.specularColor = BABYLON.Color3.Black();
 
 		const obstacleMat = new BABYLON.StandardMaterial("obstacleMat", scene);
 		obstacleMat.diffuseColor = BABYLON.Color3.FromHexString("#64748b");
+		obstacleMat.specularColor = BABYLON.Color3.Black();
 		const foodMat = new BABYLON.StandardMaterial("foodMat", scene);
 		foodMat.diffuseColor = BABYLON.Color3.FromHexString("#facc15");
 		foodMat.emissiveColor = BABYLON.Color3.FromHexString("#854d0e");
+		foodMat.specularColor = BABYLON.Color3.Black();
 
 		const syncObstacles = (obstacles: Obstacle[]) => {
 			const ids = new Set(obstacles.map((o) => o.id));
@@ -1021,11 +1227,108 @@ function BabylonWorld({
 				let mat = mesh.material as BABYLON.StandardMaterial | null;
 				if (!mat) {
 					mat = new BABYLON.StandardMaterial(`agent-mat-${a.id}`, scene);
+					mat.specularColor = BABYLON.Color3.Black();
 					mesh.material = mat;
 				}
 				mat.diffuseColor = color;
 				mat.alpha = a.alive ? 1 : 0.55;
 			}
+
+			// Update path history for all agents (tracks even when rendering is disabled).
+			for (const [id, entry] of pathsByAgent.entries()) {
+				if (!ids.has(id)) {
+					if (entry.tube) {
+						try {
+							entry.tube.dispose();
+						} catch {
+							// ignore
+						}
+					}
+					pathsByAgent.delete(id);
+				}
+			}
+
+			const y = 0.12;
+			const pathsVisible = Boolean(showPathRef.current);
+			for (const a of agents) {
+				let entry = pathsByAgent.get(a.id);
+				if (!entry) {
+					const p0 = new BABYLON.Vector3(a.x, y, a.z);
+					entry = { tube: null, points: [p0], lastPos: p0.clone() };
+					pathsByAgent.set(a.id, entry);
+				}
+
+				const p = new BABYLON.Vector3(a.x, y, a.z);
+				const lastPos = entry.lastPos;
+				const moved =
+					!lastPos ||
+					Math.sqrt((p.x - lastPos.x) * (p.x - lastPos.x) + (p.z - lastPos.z) * (p.z - lastPos.z)) >= PATH_MIN_DIST;
+				if (moved) {
+					entry.points.push(p);
+					entry.lastPos = p;
+					if (entry.points.length > PATH_MAX_POINTS) entry.points.splice(0, entry.points.length - PATH_MAX_POINTS);
+				}
+
+				if (!pathsVisible) continue;
+				const safePath = entry.points.filter(
+					(v): v is BABYLON.Vector3 =>
+						Boolean(v) &&
+						Number.isFinite((v as BABYLON.Vector3).x) &&
+						Number.isFinite((v as BABYLON.Vector3).y) &&
+						Number.isFinite((v as BABYLON.Vector3).z),
+				);
+				if (safePath.length < 2) continue;
+
+				const needsCreate = !entry.tube || (entry.tube as any).isDisposed?.() === true;
+				if (needsCreate) {
+					if (entry.tube) {
+						try {
+							entry.tube.dispose();
+						} catch {
+							// ignore
+						}
+						entry.tube = null;
+					}
+					entry.tube = BABYLON.MeshBuilder.CreateTube(
+						`path-${a.id}`,
+						{ path: safePath, radius: PATH_TUBE_RADIUS, tessellation: 8, cap: BABYLON.Mesh.CAP_ALL, updatable: true },
+						scene,
+					);
+					entry.tube.isPickable = false;
+					entry.tube.material = pathMat;
+					entry.tube.renderingGroupId = 1;
+					entry.tube.setEnabled(true);
+				} else if (moved) {
+					try {
+						BABYLON.MeshBuilder.CreateTube(
+							`path-${a.id}`,
+							{
+								path: safePath,
+								instance: entry.tube,
+								radius: PATH_TUBE_RADIUS,
+								tessellation: 8,
+								cap: BABYLON.Mesh.CAP_ALL,
+								updatable: true,
+							},
+							scene,
+						);
+						entry.tube?.setEnabled(true);
+					} catch {
+						try {
+							entry.tube?.dispose();
+						} catch {
+							// ignore
+						}
+						entry.tube = null;
+					}
+				}
+			}
+
+			// If trails were just disabled, hide all existing tubes in one pass.
+			if (lastPathsVisible && !pathsVisible) {
+				for (const entry of pathsByAgent.values()) entry.tube?.setEnabled(false);
+			}
+			lastPathsVisible = pathsVisible;
 
 			// Update vision ring around selected creature.
 			const selectedId = selectedIdRef.current;
@@ -1044,8 +1347,11 @@ function BabylonWorld({
 			const r = Math.max(0.1, visionRadiusRef.current);
 			const scale = r / DEFAULT_VISION_RADIUS;
 			visionRing.scaling.set(scale, 1, scale);
-			visionRing.position.x = selected.x;
-			visionRing.position.z = selected.z;
+			// Defensive: in dev StrictMode an old render loop can briefly run after dispose.
+			// Ensure the vector properties exist before writing into them.
+			if (!(visionRing as any).position) (visionRing as any).position = new BABYLON.Vector3(0, 0, 0);
+			(visionRing as any).position.x = selected.x;
+			(visionRing as any).position.z = selected.z;
 
 			// 120° viewing segment path in world space.
 			const cx = selected.x;
@@ -1120,6 +1426,7 @@ function BabylonWorld({
 		window.addEventListener("resize", onResize);
 
 		return () => {
+			engine.stopRenderLoop();
 			window.removeEventListener("resize", onResize);
 			engine.dispose();
 		};
@@ -1142,6 +1449,8 @@ export default function NeuralVisionSim3D() {
 	});
 	const [paused, setPaused] = useState(false);
 	const [visionRadius, setVisionRadius] = useState<number>(DEFAULT_VISION_RADIUS);
+	const [showPath, setShowPath] = useState<boolean>(false);
+	const [genomeLoadError, setGenomeLoadError] = useState<string>("");
 	const [state, setState] = useState<SimState>(() => createInitialState(settings));
 	const startPos = useMemo(() => ({ x: -HALF + 8, z: -HALF + 8 }), []);
 
@@ -1196,13 +1505,56 @@ export default function NeuralVisionSim3D() {
 		return [selectedAgent, ...topAgents];
 	}, [selectedAgent, topAgents]);
 
-	const restart = () => {
-		setState(createInitialState(settings));
+	const restart = (seedGenomes?: BrainGenome[]) => {
+		setState(createInitialState(settings, seedGenomes));
+	};
+
+	const saveTop10 = () => {
+		const top = [...state.agents]
+			.sort((a, b) => b.fitness - a.fitness)
+			.slice(0, 10)
+			.map((a) => ({
+				fitness: a.fitness,
+				energy: a.energy,
+				foodsEaten: a.foodsEaten,
+				firstFoodTime: a.firstFoodTime,
+				genome: a.genome,
+			}));
+
+		const payload: SavedSim3GenomesV1 = {
+			version: 1,
+			sim: "sim3",
+			createdAt: new Date().toISOString(),
+			top,
+		};
+		downloadJson("sim3-top10-genomes.json", payload);
+	};
+
+	const loadTop10FromFile = async (file: File) => {
+		setGenomeLoadError("");
+		try {
+			const text = await file.text();
+			const json = JSON.parse(text);
+			if (!isSavedSim3GenomesV1(json)) {
+				throw new Error("Invalid file format. Expected a Sim 3 genomes export.");
+			}
+			const genomes = json.top.map((e) => e.genome).filter(Boolean);
+			restart(genomes);
+			setSelectedAgentId(null);
+		} catch (e: any) {
+			setGenomeLoadError(String(e?.message ?? e));
+		}
 	};
 
 	return (
 		<>
-			<BabylonWorld state={state} visionRadius={visionRadius} selectedAgentId={selectedAgentId} onSelectAgent={setSelectedAgentId} />
+			<BabylonWorld
+				state={state}
+				visionRadius={visionRadius}
+				showPath={showPath}
+				selectedAgentId={selectedAgentId}
+				onSelectAgent={setSelectedAgentId}
+			/>
 			<aside className="controls-panel">
 				<Card className="bg-transparent border-0 shadow-none">
 					<div className="controls-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
@@ -1233,6 +1585,13 @@ export default function NeuralVisionSim3D() {
 								<div>
 									<div className="flex justify-between text-sm mb-1"><span>Vision Radius</span><span>{visionRadius.toFixed(1)}</span></div>
 									<Slider value={[visionRadius]} min={1} max={16} step={0.5} onValueChange={(v: number[]) => setVisionRadius(v[0])} />
+								</div>
+								<div>
+									<div className="flex justify-between text-sm mb-1"><span>Paths</span><span>{showPath ? "On" : "Off"}</span></div>
+									<label className="flex items-center justify-between rounded-xl border border-slate-700 p-3 text-sm">
+										<span>Show paths (all creatures)</span>
+										<input type="checkbox" checked={showPath} onChange={(e) => setShowPath(e.target.checked)} />
+									</label>
 								</div>
 								<div>
 									<div className="flex justify-between text-sm mb-1"><span>Learning</span><span>{settings.learningEnabled ? "On" : "Off"}</span></div>
@@ -1273,6 +1632,30 @@ export default function NeuralVisionSim3D() {
 									<div className="flex justify-between text-sm mb-1"><span>Population (restart)</span><span>{settings.population}</span></div>
 									<Slider value={[settings.population]} min={40} max={180} step={1} onValueChange={(v: number[]) => setSettings((p) => ({ ...p, population: Math.round(v[0]) }))} />
 								</div>
+							</div>
+
+							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-2">
+								<div className="font-semibold">Genomes</div>
+								<div className="grid grid-cols-2 gap-2">
+									<Button variant="secondary" onClick={saveTop10}>Save best 10</Button>
+									<label className="w-full">
+										<input
+											type="file"
+											accept="application/json,.json"
+											className="w-full rounded-md border border-slate-700 bg-slate-900/50 p-2 text-sm"
+											onChange={(e) => {
+												const f = e.target.files?.[0];
+												if (f) void loadTop10FromFile(f);
+												// allow re-selecting the same file
+												e.target.value = "";
+											}}
+										/>
+									</label>
+								</div>
+								<div className="text-xs text-slate-300">
+									Save downloads a JSON file. Loading a JSON file restarts the sim seeded with those genomes.
+								</div>
+								{genomeLoadError ? <div className="text-xs text-red-300">{genomeLoadError}</div> : null}
 							</div>
 
 							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-2">

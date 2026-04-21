@@ -9,6 +9,10 @@ A 3D genetic-algorithm simulation where a population of triangle agents evolves 
 - Food targets.
 - A population of moving triangle agents.
 
+Notes:
+- Obstacles spawn across the full world (all directions).
+- World edges behave like obstacles (agents are repelled/clamped at the boundary).
+
 ## Controls (left panel)
 - **Pause / Resume**: stops/continues stepping.
 - **Restart**: resets the world back to generation 1.

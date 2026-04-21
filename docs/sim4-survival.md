@@ -49,18 +49,21 @@ Goal: **escape** by reaching the green exit ring.
 ## Local AI (LM Studio) integration
 This sim supports LM Studio’s OpenAI-compatible server.
 
-LM Studio endpoints:
-- `GET  http://localhost:1234/v1/models`
-- `POST http://localhost:1234/v1/chat/completions`
+LM Studio endpoints (the sim treats your setting as a **base URL**):
+- `GET  <base>/api/v1/models`
+- `POST <base>/api/v1/models/load`
+- `POST <base>/v1/responses` (preferred for tool calling)
+- Fallbacks: `POST <base>/api/v1/chat` and/or `POST <base>/v1/chat/completions`
 
 In the UI:
 - Set **AI Provider** to `local`
-- Set **Local endpoint URL** to:
-	- `http://127.0.0.1:1234/v1/chat/completions` (default)
-- Set **Local model name** to one of the IDs returned by `/v1/models`
+- Set **LM Studio base URL** to:
+	- `/lmstudio` (dev proxy; avoids browser CORS)
+	- or `http://127.0.0.1:1234` (direct)
+- Set **Local model name** to one of the IDs returned by `GET /api/v1/models` (default is `google/gemma-4-e2b`).
 
 ### Expected model response
-The model must reply with **ONLY** a JSON object:
+The sim will try to use tool calling to obtain structured action arguments. If it falls back to text, the model must reply with **ONLY** a JSON object:
 
 ```json
 {
@@ -94,6 +97,7 @@ Notes:
 
 ### City collisions
 - Buildings block movement. Movement uses sub-stepping + penetration resolution to reduce tunneling.
+- The world boundary has visible walls (so the vision model can see the edge) and edges behave like obstacles.
 
 ### Rocks and combat
 - Rocks exist in the world.
