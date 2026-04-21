@@ -51,6 +51,24 @@ function Home() {
         <p className="eyebrow">Simulation Hub</p>
         <h1>Choose a Simulation</h1>
         <p className="subtitle">Launch any simulation from this list. Add new ones to this page as your library grows.</p>
+    <div className="home-actions">
+      <a
+        className="docs-btn"
+        href="https://github.com/sidd5sci/survival-sim"
+        target="_blank"
+        rel="noreferrer"
+      >
+        GitHub Repo
+      </a>
+      <a
+        className="launch-btn"
+        href="https://paypal.me/learnkevin?locale.x=en_GB&country.x=IN"
+        target="_blank"
+        rel="noreferrer"
+      >
+        Buy me a coffee
+      </a>
+    </div>
       </section>
 
       <section className="sim-grid" aria-label="Simulation list">

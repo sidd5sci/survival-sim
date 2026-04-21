@@ -62,12 +62,15 @@ type EvoSettings = {
 	eliteCount: number;
 	topologyMutationRate: number;
 	crossoverRate: number;
+	activation: ActivationName;
 	// Generation duration in seconds.
 	generationSeconds: number;
 	// If enabled, agents can update their own DNA weights/biases during a generation.
 	learningEnabled?: boolean;
 	learningRate?: number;
 };
+
+type ActivationName = "tanh" | "relu" | "sigmoid";
 
 type SimState = {
 	generation: number;
@@ -106,15 +109,17 @@ const FOOD_COUNT = 16;
 const OBSTACLE_COUNT = 30;
 const DEFAULT_VISION_RADIUS = 5;
 const INPUTS = 10;
-const OUTPUTS = 5;
+const OUTPUTS = 4;
 const OUT_LEFT = 0;
 const OUT_RIGHT = 1;
 const OUT_FORWARD = 2;
-const OUT_BACKWARD = 3;
-const OUT_SPEED = 4;
+const OUT_SPEED = 3;
 const MAX_SPEED = 4.9;
 const ACCEL = 8.5;
 const DRAG = 0.89;
+
+// Turning speed (radians/sec) when left/right outputs activate.
+const TURN_RATE = 4.2;
 
 const MAX_HIDDEN_LAYERS = 5;
 
@@ -202,6 +207,26 @@ function clamp(v: number, min: number, max: number): number {
 
 function rand(min: number, max: number): number {
 	return Math.random() * (max - min) + min;
+}
+
+function sigmoid(x: number): number {
+	// Numerically stable-ish sigmoid.
+	if (x >= 0) {
+		const z = Math.exp(-x);
+		return 1 / (1 + z);
+	}
+	const z = Math.exp(x);
+	return z / (1 + z);
+}
+
+function relu(x: number): number {
+	return x > 0 ? x : 0;
+}
+
+function activate(name: ActivationName, x: number): number {
+	if (name === "relu") return relu(x);
+	if (name === "sigmoid") return sigmoid(x);
+	return Math.tanh(x);
 }
 
 function normalize(x: number, z: number): Vec2 {
@@ -415,6 +440,18 @@ function ensureGenomeInputShape(genome: BrainGenome): BrainGenome {
 		next.inputHiddenWeights[i] = fixRowLen(next.inputHiddenWeights[i] ?? [], next.hiddenSize, randomWeight);
 		next.inputHiddenMask[i] = fixRowLen(next.inputHiddenMask[i] ?? [], next.hiddenSize, randomMask);
 	}
+
+	// Output shape compatibility: older saves may have different OUTPUTS (e.g. included backward).
+	while (next.hiddenOutputWeights.length < next.hiddenSize) next.hiddenOutputWeights.push([]);
+	while (next.hiddenOutputMask.length < next.hiddenSize) next.hiddenOutputMask.push([]);
+	if (next.hiddenOutputWeights.length > next.hiddenSize) next.hiddenOutputWeights = next.hiddenOutputWeights.slice(0, next.hiddenSize);
+	if (next.hiddenOutputMask.length > next.hiddenSize) next.hiddenOutputMask = next.hiddenOutputMask.slice(0, next.hiddenSize);
+	for (let h = 0; h < next.hiddenSize; h += 1) {
+		next.hiddenOutputWeights[h] = fixRowLen(next.hiddenOutputWeights[h] ?? [], OUTPUTS, randomWeight);
+		next.hiddenOutputMask[h] = fixRowLen(next.hiddenOutputMask[h] ?? [], OUTPUTS, randomMask);
+	}
+	if (next.outputBiases.length > OUTPUTS) next.outputBiases = next.outputBiases.slice(0, OUTPUTS);
+	while (next.outputBiases.length < OUTPUTS) next.outputBiases.push(randomWeight());
 
 	return next;
 }
@@ -852,13 +889,15 @@ function getVisionInputs(agent: Agent, foods: Food[], obstacles: Obstacle[], vis
 }
 
 function neuralSteer(genome: BrainGenome, inputs: number[]): Vec2 {
-	const { steer } = forwardPass(genome, inputs);
-	return steer;
+	// Deprecated shim (kept for convenience): returns an approximate steering vector.
+	const r = forwardPass(genome, inputs, "tanh");
+	const z = r.forward01;
+	return { x: r.turn, z };
 }
 
 // Forward pass through the creature's neural net.
 // Returns both movement steering (phenotype) and intermediate activations for learning + visualization.
-function forwardPass(genome: BrainGenome, inputs: number[]) {
+function forwardPass(genome: BrainGenome, inputs: number[], activation: ActivationName) {
 	const hiddenLayers: number[][] = Array.from({ length: genome.hiddenLayers }, () => new Array(genome.hiddenSize).fill(0));
 
 	// Input -> first hidden
@@ -867,7 +906,7 @@ function forwardPass(genome: BrainGenome, inputs: number[]) {
 		for (let i = 0; i < INPUTS; i += 1) {
 			if (genome.inputHiddenMask[i][h] > 0.5) sum += inputs[i] * genome.inputHiddenWeights[i][h];
 		}
-		hiddenLayers[0][h] = Math.tanh(sum);
+		hiddenLayers[0][h] = activate(activation, sum);
 	}
 
 	// Hidden -> hidden
@@ -877,7 +916,7 @@ function forwardPass(genome: BrainGenome, inputs: number[]) {
 			for (let i = 0; i < genome.hiddenSize; i += 1) {
 				if (genome.hiddenHiddenMask[l - 1][i][h] > 0.5) sum += hiddenLayers[l - 1][i] * genome.hiddenHiddenWeights[l - 1][i][h];
 			}
-			hiddenLayers[l][h] = Math.tanh(sum);
+			hiddenLayers[l][h] = activate(activation, sum);
 		}
 	}
 
@@ -893,18 +932,27 @@ function forwardPass(genome: BrainGenome, inputs: number[]) {
 
 	// Output neurons are fixed actions:
 	// left, right, forward, backward, speed.
-	const act = out.map((v) => Math.tanh(v));
-	let rawX = clamp((act[OUT_RIGHT] ?? 0) - (act[OUT_LEFT] ?? 0), -1, 1);
-	let rawZ = clamp((act[OUT_FORWARD] ?? 0) - (act[OUT_BACKWARD] ?? 0), -1, 1);
+	let act: number[];
+	let speed01 = 0;
+	let forward01 = 0;
+	if (activation === "tanh") {
+		act = out.map((v) => Math.tanh(v));
+		speed01 = clamp(((act[OUT_SPEED] ?? 0) + 1) * 0.5, 0, 1);
+		forward01 = clamp(((act[OUT_FORWARD] ?? 0) + 1) * 0.5, 0, 1);
+	} else if (activation === "sigmoid") {
+		act = out.map((v) => sigmoid(v));
+		speed01 = clamp(act[OUT_SPEED] ?? 0, 0, 1);
+		forward01 = clamp(act[OUT_FORWARD] ?? 0, 0, 1);
+	} else {
+		// relu
+		act = out.map((v) => clamp(relu(v), 0, 1));
+		speed01 = clamp(act[OUT_SPEED] ?? 0, 0, 1);
+		forward01 = clamp(act[OUT_FORWARD] ?? 0, 0, 1);
+	}
 
-	// IMPORTANT: Don't normalize tiny outputs to a unit vector.
-	// Normalizing near-zero vectors makes agents move in arbitrary circles instead of stopping.
-	const mag = Math.sqrt(rawX * rawX + rawZ * rawZ);
-	const steer = mag < 0.08 ? { x: 0, z: 0 } : mag > 1 ? { x: rawX / mag, z: rawZ / mag } : { x: rawX, z: rawZ };
+	const turn = clamp((act[OUT_RIGHT] ?? 0) - (act[OUT_LEFT] ?? 0), -1, 1);
 
-	const speed01 = clamp(((act[OUT_SPEED] ?? 0) + 1) * 0.5, 0, 1);
-
-	return { hiddenLayers, out, steer, speed01 };
+	return { hiddenLayers, out, turn, forward01, speed01 };
 }
 
 // Simple (optional) on-policy learning that writes back into DNA (Lamarckian).
@@ -1067,7 +1115,8 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 		}
 
 		const inputs = getVisionInputs(agent, prev.foods, prev.obstacles, visionRadius);
-		const { hiddenLayers, out, steer, speed01 } = forwardPass(agent.genome, inputs);
+		const activation = settings.activation ?? "tanh";
+		const { hiddenLayers, out, turn, forward01, speed01 } = forwardPass(agent.genome, inputs, activation);
 		const desiredMaxSpeed = MAX_SPEED * speed01;
 
 		const prevVx = agent.vx;
@@ -1077,10 +1126,14 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 		let x = agent.x;
 		let z = agent.z;
 		let collidedThisStep = false;
+		let headingX = agent.headingX;
+		let headingZ = agent.headingZ;
 
 		// Sub-step integration to prevent tunneling through obstacles.
-		const ax = steer.x * ACCEL * speed01;
-		const az = steer.z * ACCEL * speed01;
+		// Control scheme:
+		// - L/R outputs turn the creature (updates heading)
+		// - F output moves forward along heading
+		// - Speed output scales acceleration + max speed
 		const estSpeed = Math.sqrt(vx * vx + vz * vz);
 		const maxStepDist = Math.max(AGENT_RADIUS * 0.75, 0.12);
 		const steps = clamp(Math.ceil((estSpeed * dt) / maxStepDist), 1, 18);
@@ -1088,6 +1141,23 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 		const dragFactor = Math.pow(DRAG, 1 / steps);
 
 		for (let s = 0; s < steps; s += 1) {
+			// Apply turning (can turn even while stopped).
+			const t = clamp(turn, -1, 1);
+			const ang = t * TURN_RATE * dtStep;
+			if (Math.abs(ang) > 1e-6) {
+				const c = Math.cos(ang);
+				const sn = Math.sin(ang);
+				const nx = headingX * c - headingZ * sn;
+				const nz = headingX * sn + headingZ * c;
+				const n = normalize(nx, nz);
+				headingX = n.x;
+				headingZ = n.z;
+			}
+
+			const throttle = clamp(forward01, 0, 1);
+			const ax = headingX * ACCEL * throttle * speed01;
+			const az = headingZ * ACCEL * throttle * speed01;
+
 			vx = (vx + ax * dtStep) * dragFactor;
 			vz = (vz + az * dtStep) * dragFactor;
 			const speedNow = Math.sqrt(vx * vx + vz * vz) || 1;
@@ -1133,13 +1203,7 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
 			vz = 0;
 		}
 
-		let headingX = agent.headingX;
-		let headingZ = agent.headingZ;
-		const vmag = Math.sqrt(vx * vx + vz * vz);
-		if (vmag > 0.02) {
-			headingX = vx / vmag;
-			headingZ = vz / vmag;
-		}
+		// Keep heading from control/turning (not velocity-derived).
 
 		let collisions = agent.collisions + (collidedThisStep ? 1 : 0);
 
@@ -1804,6 +1868,7 @@ export default function NeuralVisionSim3D() {
 		eliteCount: 10,
 		topologyMutationRate: 0.06,
 		crossoverRate: 0.8,
+		activation: "tanh",
 		generationSeconds: DEFAULT_GENERATION_SECONDS,
 		// Optional learning (Lamarckian): creatures can slightly adjust their own weights during a generation.
 		learningEnabled: true,
@@ -2053,6 +2118,18 @@ export default function NeuralVisionSim3D() {
 									<Slider value={[visionRadius]} min={1} max={16} step={0.5} onValueChange={(v: number[]) => setVisionRadius(v[0])} />
 								</div>
 								<div>
+									<div className="flex justify-between text-sm mb-1"><span>Activation</span> : <span>{settings.activation}</span></div>
+									<select
+										className="w-full rounded-md border border-slate-700 bg-slate-900/50 p-2 text-sm"
+										value={settings.activation}
+										onChange={(e) => setSettings((p) => ({ ...p, activation: e.target.value as ActivationName }))}
+									>
+										<option value="tanh">tanh</option>
+										<option value="relu">ReLU</option>
+										<option value="sigmoid">sigmoid</option>
+									</select>
+								</div>
+								<div>
 									<div className="flex justify-between text-sm mb-1"><span>Iteration Duration</span><span>{Math.round(settings.generationSeconds)}s</span></div>
 									<Slider
 										value={[settings.generationSeconds]}
@@ -2172,7 +2249,7 @@ function NeuralNetGraph({
 	const outputYs = Array.from({ length: OUTPUTS }, (_, i) => padY + (i * (height - 2 * padY)) / Math.max(1, OUTPUTS - 1));
 
 	const inputLabels = ["Fx", "Fz", "Fd", "Ox", "Oz", "Od", "Vx", "Vz", "En", "Fit"];
-	const outputLabels = ["L", "R", "F", "B", "S"];
+	const outputLabels = ["L", "R", "F", "S"];
 
 	const clamp01 = (v: number) => clamp(v, 0, 1);
 	const normAct = (v: number | undefined) => {
