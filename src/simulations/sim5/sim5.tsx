@@ -132,6 +132,9 @@ type AiAction = {
 	pick?: boolean;
 	throw?: boolean;
 	grow?: boolean;
+	seesGreenCheckpoint?: boolean;
+	seesStone?: boolean;
+	seesRedEnemy?: boolean;
 };
 
 function round3(v: number): number {
@@ -151,6 +154,9 @@ function sanitizeAction(action: Partial<AiAction> | null | undefined): AiAction 
 		pick: a.pick === true,
 		throw: a.throw === true,
 		grow: a.grow === true,
+		seesGreenCheckpoint: a.seesGreenCheckpoint === true,
+		seesStone: a.seesStone === true,
+		seesRedEnemy: a.seesRedEnemy === true,
 	};
 }
 
@@ -201,6 +207,15 @@ function ensureNonIdleAction(action: AiAction, bot: Bot, state?: any): AiAction 
 		}
 		next.forward = Math.max(next.forward, 0.45);
 		next.backward = 0;
+	}
+
+	// Penalize unnecessary pure rotation: if turning a lot with little forward progress and not under threat, push movement.
+	const pureTurn = Math.abs(next.right - next.left) > 0.45 && Math.abs(next.forward - next.backward) < 0.2;
+	const lowProgress = !state || typeof state.botSpeed !== "number" ? false : state.botSpeed < 0.28;
+	if (pureTurn && lowProgress && state?.underThreat !== true) {
+		next.forward = Math.max(next.forward, 0.62);
+		next.backward = 0;
+		next.speed = Math.max(next.speed, 0.68);
 	}
 
 	// If enemy is close (red object), run away from it.
@@ -272,12 +287,16 @@ async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState:
 		"Return ONLY one minified JSON object. No reasoning. No prose. No markdown.\n" +
 		"Do NOT output ``` or ```json fences. Do NOT output backticks.\n" +
 		"Output must start with { and end with }.\n" +
-		"Keys: left,right,forward,backward in [-1..1], speed in [0..1], optional booleans pick,throw,grow.\n" +
+		"Keys: left,right,forward,backward in [-1..1], speed in [0..1], booleans pick,throw,grow,seesGreenCheckpoint,seesStone,seesRedEnemy.\n" +
 		"Actions: pick picks nearest rock if close and hands free; throw throws held rock forward; grow increases capacity if enough energy.\n" +
+		"Optimization objective: reach the green checkpoint as FAST as possible (maximize speed to goal).\n" +
+		"Penalty rule: unnecessary spinning/rotation without progress is BAD and should be avoided.\n" +
+		"Reward rule: sustained movement toward green checkpoint is GOOD.\n" +
 		"Vision rule: RED object means enemy, immediately run away from it.\n" +
 		"Vision rule: GRAY/WHITE object means stone, move to it and pick it when close.\n" +
 		"Primary goal: find the GREEN EXIT RING in the visual image and move toward it continuously.\n" +
 		"Exploration rule: do not drive straight forever; frequently turn left/right to scan surroundings when target is unclear.\n" +
+		"In EVERY response, set seesGreenCheckpoint/seesStone/seesRedEnemy true or false based on current vision.\n" +
 		"Use both image and state: exitForward and exitRight are direction-to-exit in bot-local coordinates.\n" +
 		"Steering policy: if exitForward > 0.15 set forward >= 0.7 and backward = 0; if exitForward < -0.15 set backward >= 0.45.\n" +
 		"Steering policy: if exitRight > 0.15 set right >= 0.55 and left = 0; if exitRight < -0.15 set left >= 0.55 and right = 0.\n" +
@@ -285,7 +304,7 @@ async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState:
 		"If green ring is NOT visible, keep exploring: speed >= 0.55 and use turn (left or right) plus some forward.\n" +
 		"Never output all movement axes as zero. Never output speed > 0 with zero movement axes.\n" +
 		"Avoid repeating the exact same action many ticks in a row; adapt using latest image and state.\n" +
-		"Example: {\"left\":0,\"right\":0,\"forward\":1,\"backward\":0,\"speed\":0.8}";
+		"Example: {\"left\":0,\"right\":0.3,\"forward\":0.9,\"backward\":0,\"speed\":0.85,\"pick\":false,\"throw\":false,\"grow\":false,\"seesGreenCheckpoint\":true,\"seesStone\":false,\"seesRedEnemy\":false}";
 
 	const userText = JSON.stringify(compactState);
 	const safeVision = visionDataUrl && visionDataUrl.length > 0 ? visionDataUrl : null;
@@ -307,6 +326,9 @@ async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState:
 				pick: { type: "boolean" },
 				throw: { type: "boolean" },
 				grow: { type: "boolean" },
+				seesGreenCheckpoint: { type: "boolean" },
+				seesStone: { type: "boolean" },
+				seesRedEnemy: { type: "boolean" },
 			},
 			required: ["left", "right", "forward", "backward", "speed"],
 		},
@@ -673,7 +695,7 @@ function BabylonWorld({
 		});
 
 		// Vision rendering should include relevant meshes
-		visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, ...Array.from(buildingMeshes.values()), torso, head];
+		visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, exit, ...Array.from(buildingMeshes.values()), torso, head];
 		// Enemies/rocks are added dynamically via sync functions; we will refresh renderList periodically.
 		let lastRenderListRefresh = 0;
 
@@ -901,7 +923,7 @@ function BabylonWorld({
 			// Refresh vision render list occasionally.
 			if (now - lastRenderListRefresh > 800) {
 				lastRenderListRefresh = now;
-				visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, ...Array.from(buildingMeshes.values()), torso, head, ...Array.from(enemyMeshes.values()), ...Array.from(rockMeshes.values())];
+				visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, exit, ...Array.from(buildingMeshes.values()), torso, head, ...Array.from(enemyMeshes.values()), ...Array.from(rockMeshes.values())];
 			}
 
 			const s = settingsRef.current;
@@ -910,7 +932,6 @@ function BabylonWorld({
 				// AI tick
 				const aiPeriodMs = 1000 / Math.max(0.2, s.aiHz);
 				if (!pendingAi && now - lastAiAt >= aiPeriodMs) {
-					lastAiAt = now;
 					pendingAi = true;
 					(void (async () => {
 						let asked = "";
@@ -959,6 +980,7 @@ function BabylonWorld({
 								error: String((err as any)?.message ?? err ?? "Unknown error"),
 							});
 						 } finally {
+							lastAiAt = performance.now();
 							pendingAi = false;
 						}
 					})());
@@ -1228,7 +1250,7 @@ export default function CityEscapeSim3D() {
 		localModelName: "google/gemma-4-e2b",
 		replicateApiToken: "",
 		replicateModel: "",
-		visionResolution: 32,
+		visionResolution: 64,
 		aiHz: 2,
 		enemySpeed: 3.2,
 		enemyDamagePerSec: 14,
