@@ -22,7 +22,7 @@ Live demo: https://survival-sim.vercel.app/
 - Sim 2 (Genetic Triangles GA): [docs/sim2-genetic-triangles.md](docs/sim2-genetic-triangles.md)
 - Sim 3 (Neural Vision GA): [docs/sim3-neural-vision-ga.md](docs/sim3-neural-vision-ga.md)
 - Sim 4 (Maze Neural Vision GA): [docs/sim4-maze-neural-vision-ga.md](docs/sim4-maze-neural-vision-ga.md)
-- Sim 5 (City Escape AI): [docs/sim5-city-escape-ai.md](docs/sim5-city-escape-ai.md)
+- Sim 15 (City Escape AI): [docs/sim15-city-escape-ai.md](docs/sim15-city-escape-ai.md)
 
 ## Thumbnails
 

@@ -3,7 +3,7 @@ import SurvivalSim3D from './simulations/sim1/sim.tsx'
 import GeneticTrianglesSim3D from './simulations/sim2/sim2.tsx'
 import NeuralVisionSim3D from './simulations/sim3/sim3.tsx'
 import MazeNeuralVisionSim3D from './simulations/sim4/sim4.tsx'
-import CityEscapeSim3D from './simulations/sim5/sim5.tsx'
+import CityEscapeSim3D from './simulations/sim15/sim15.tsx'
 import CityEscapeGeneticSim3D from './simulations/sim6/sim6.tsx'
 import './App.css'
 
@@ -41,14 +41,14 @@ const simulations = [
     title: 'City Escape AI 3D',
     description: 'One articulated bot must escape a procedural city while enemies chase; vision is sent as a low-res matrix to a configurable AI endpoint.',
     status: 'MVP',
-		docsPath: '/docs/sim5-city-escape-ai.md',
+		docsPath: '/docs/sim15-city-escape-ai.md',
   },
   {
     id: 'city-escape-genetic-3d',
     title: 'City Escape Genetic NN 3D',
     description: 'Large neural network trained with genetic evolution from bot vision + instruction features; outputs direct bot actions in real time.',
     status: 'New',
-		docsPath: '/docs/sim5-city-escape-ai.md',
+		docsPath: '/docs/sim15-city-escape-ai.md',
   },
 ]
 
