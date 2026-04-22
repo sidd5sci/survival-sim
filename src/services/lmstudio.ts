@@ -134,6 +134,35 @@ export type LmStudioResponsesRequest = {
 	temperature?: number;
 };
 
+export function extractJsonFromText(text: string): any {
+	// Try fenced ```json blocks first
+	const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
+	if (fenced?.[1]) {
+		try {
+			return JSON.parse(fenced[1]);
+		} catch {
+			// fallthrough
+		}
+	}
+
+	// Try to find the last complete {...} block (handles reasoning models that output text before JSON)
+	let searchFrom = text.length;
+	while (searchFrom > 0) {
+		const last = text.lastIndexOf("}", searchFrom - 1);
+		if (last < 0) break;
+		const first = text.lastIndexOf("{", last);
+		if (first < 0) break;
+		try {
+			return JSON.parse(text.slice(first, last + 1));
+		} catch {
+			searchFrom = last;
+		}
+	}
+
+	// Last resort: direct parse
+	return JSON.parse(text);
+}
+
 function extractFirstToolCallArgs(json: any): { name: string; args: any } | null {
 	const outItems: any[] = Array.isArray(json?.output) ? json.output : [];
 	for (const it of outItems) {
@@ -157,6 +186,27 @@ function extractFirstToolCallArgs(json: any): { name: string; args: any } | null
 			const args = it?.arguments ?? it?.input ?? it?.params;
 			if (name) return { name, args };
 		}
+
+		// Some servers/models ignore tool-calling and return text messages anyway.
+		if (it?.type === "message" && typeof it?.content === "string") {
+			try {
+				const parsed = extractJsonFromText(String(it.content));
+				if (parsed && typeof parsed === "object") return { name: "act", args: parsed };
+			} catch {
+				// ignore and continue scanning
+			}
+		}
+	}
+
+	// OpenAI-style fallback if the server emitted choices content.
+	const msg = json?.choices?.[0]?.message?.content;
+	if (typeof msg === "string") {
+		try {
+			const parsed = extractJsonFromText(msg);
+			if (parsed && typeof parsed === "object") return { name: "act", args: parsed };
+		} catch {
+			// ignore
+		}
 	}
 	return null;
 }
@@ -172,11 +222,12 @@ export async function lmStudioResponsesToolCall(req: LmStudioResponsesRequest): 
 	const safeVision = req.visionDataUrl && req.visionDataUrl.length > 0 ? req.visionDataUrl : null;
 
 	const makeBody = (input: any) => {
+		const toolChoice = typeof req.toolChoice === "object" ? "required" : (req.toolChoice ?? "auto");
 		const body: any = {
 			model: modelKey,
 			input,
 			tools: req.tools,
-			tool_choice: req.toolChoice ?? "auto",
+			tool_choice: toolChoice,
 			temperature,
 			max_output_tokens,
 		};
@@ -332,6 +383,7 @@ export async function lmStudioChatText(req: LmStudioChatRequest): Promise<string
 
 	if (res.ok) {
 		const json = await res.json();
+		// LM Studio native response format
 		const outItems: any[] = Array.isArray(json?.output) ? json.output : [];
 		const messages = outItems
 			.filter((it) => it?.type === "message" && typeof it?.content === "string")
@@ -341,7 +393,17 @@ export async function lmStudioChatText(req: LmStudioChatRequest): Promise<string
 		const reasoning = outItems
 			.filter((it) => it?.type === "reasoning" && typeof it?.content === "string")
 			.map((it) => String(it.content));
-		return reasoning.length ? reasoning[reasoning.length - 1] : "";
+		if (reasoning.length) return reasoning[reasoning.length - 1];
+
+		// Fallback: OpenAI-style response (LM Studio may return this format)
+		const choicesContent = json?.choices?.[0]?.message?.content;
+		if (typeof choicesContent === "string" && choicesContent) return choicesContent;
+
+		// Also handle LM Studio text field directly
+		if (typeof json?.text === "string" && json.text) return json.text;
+		if (typeof json?.content === "string" && json.content) return json.content;
+
+		return "";
 	}
 
 	if (!errText) {

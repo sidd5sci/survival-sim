@@ -3,7 +3,7 @@ import * as BABYLON from "babylonjs";
 import { Card, CardContent } from "../../components/ui/card";
 import { Button } from "../../components/ui/button";
 import { Slider } from "../../components/ui/slider";
-import { ensureLmStudioModelReady, lmStudioChatText, lmStudioResponsesToolCall, normalizeLmStudioBaseUrl } from "../../services/lmstudio";
+import { ensureLmStudioModelReady, extractJsonFromText, lmStudioChatText, lmStudioResponsesToolCall, normalizeLmStudioBaseUrl } from "../../services/lmstudio";
 import { replicatePredict } from "../../services/replicate";
 
 type Vec2 = { x: number; z: number };
@@ -80,6 +80,16 @@ type UiSnapshot = {
 	status: string;
 };
 
+type AiExchange = {
+	id: string;
+	provider: AiProvider;
+	model: AiModel;
+	asked: string;
+	replied: string;
+	at: number;
+	error?: string;
+};
+
 const WORLD_SIZE = 120;
 const HALF = WORLD_SIZE / 2;
 const BOT_RADIUS = 0.6;
@@ -128,28 +138,7 @@ function round3(v: number): number {
 	return Math.round(v * 1000) / 1000;
 }
 
-function extractJsonObject(text: string): any {
-	// Try fenced ```json blocks first
-	const fenced = text.match(/```json\s*([\s\S]*?)\s*```/i);
-	if (fenced?.[1]) {
-		try {
-			return JSON.parse(fenced[1]);
-		} catch {
-			// fallthrough
-		}
-	}
 
-	// Then try first {...last} heuristic
-	const first = text.indexOf("{");
-	const last = text.lastIndexOf("}");
-	if (first >= 0 && last > first) {
-		const slice = text.slice(first, last + 1);
-		return JSON.parse(slice);
-	}
-
-	// Lastly, attempt direct parse
-	return JSON.parse(text);
-}
 
 function sanitizeAction(action: Partial<AiAction> | null | undefined): AiAction {
 	const a = action ?? {};
@@ -183,6 +172,98 @@ function defaultFallbackAction(bot: Bot): AiAction {
 		grow: bot.energy < bot.maxEnergy * 0.25,
 	};
 }
+
+function ensureNonIdleAction(action: AiAction, bot: Bot, state?: any): AiAction {
+	const movementIntent = Math.abs(action.forward - action.backward) + Math.abs(action.right - action.left);
+
+	// If model sends speed with no directional intent, inject a safe directional fallback.
+	if (movementIntent <= 0.05) {
+		const fallback = defaultFallbackAction(bot);
+		return {
+			...fallback,
+			pick: action.pick,
+			throw: action.throw,
+			grow: action.grow,
+		};
+	}
+
+	let next: AiAction = { ...action };
+
+	// If exit is strongly to one side and model is only going forward, inject turn.
+	const turnIntent = Math.abs(next.right - next.left);
+	if (state && typeof state.exitRight === "number" && Math.abs(state.exitRight) > 0.25 && turnIntent < 0.12) {
+		if (state.exitRight > 0) {
+			next.right = Math.max(next.right, Math.min(1, Math.abs(state.exitRight)));
+			next.left = 0;
+		} else {
+			next.left = Math.max(next.left, Math.min(1, Math.abs(state.exitRight)));
+			next.right = 0;
+		}
+		next.forward = Math.max(next.forward, 0.45);
+		next.backward = 0;
+	}
+
+	// If enemy is close (red object), run away from it.
+	if (
+		state &&
+		state.underThreat === true &&
+		typeof state.nearestEnemyDist === "number" &&
+		typeof state.nearestEnemyForward === "number" &&
+		typeof state.nearestEnemyRight === "number"
+	) {
+		if (state.nearestEnemyForward > 0) {
+			next.backward = Math.max(next.backward, 0.7);
+			next.forward = 0;
+		} else {
+			next.forward = Math.max(next.forward, 0.7);
+			next.backward = 0;
+		}
+		if (state.nearestEnemyRight > 0) {
+			next.left = Math.max(next.left, 0.65);
+			next.right = 0;
+		} else {
+			next.right = Math.max(next.right, 0.65);
+			next.left = 0;
+		}
+		next.speed = Math.max(next.speed, 0.8);
+	}
+
+	// If gray/white stone is near and safe, bias toward collecting it.
+	if (
+		state &&
+		state.underThreat !== true &&
+		state.heldRock !== true &&
+		typeof state.nearestRockDist === "number" &&
+		typeof state.nearestRockForward === "number" &&
+		typeof state.nearestRockRight === "number" &&
+		state.nearestRockDist < 10
+	) {
+		if (state.nearestRockForward > 0) {
+			next.forward = Math.max(next.forward, 0.65);
+			next.backward = 0;
+		}
+		if (state.nearestRockRight > 0.1) {
+			next.right = Math.max(next.right, Math.min(1, Math.abs(state.nearestRockRight)));
+			next.left = 0;
+		} else if (state.nearestRockRight < -0.1) {
+			next.left = Math.max(next.left, Math.min(1, Math.abs(state.nearestRockRight)));
+			next.right = 0;
+		}
+		if (state.nearestRockDist < 2.3) next.pick = true;
+		next.speed = Math.max(next.speed, 0.6);
+	}
+
+	// Direction exists but speed may be too low; nudge it so movement continues.
+	if (next.speed < 0.35) {
+		return {
+			...next,
+			speed: 0.55,
+		};
+	}
+
+	return next;
+}
+
 async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState: any, visionDataUrl?: string | null): Promise<AiAction> {
 	const modelKey = model.trim();
 	if (!modelKey) throw new Error("Missing model key");
@@ -193,8 +274,17 @@ async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState:
 		"Output must start with { and end with }.\n" +
 		"Keys: left,right,forward,backward in [-1..1], speed in [0..1], optional booleans pick,throw,grow.\n" +
 		"Actions: pick picks nearest rock if close and hands free; throw throws held rock forward; grow increases capacity if enough energy.\n" +
-		"Goal: survive, avoid enemies, reach the green exit ring.\n" +
-        "If you are unclear where you are try to turn left or right to explore.\n" +
+		"Vision rule: RED object means enemy, immediately run away from it.\n" +
+		"Vision rule: GRAY/WHITE object means stone, move to it and pick it when close.\n" +
+		"Primary goal: find the GREEN EXIT RING in the visual image and move toward it continuously.\n" +
+		"Exploration rule: do not drive straight forever; frequently turn left/right to scan surroundings when target is unclear.\n" +
+		"Use both image and state: exitForward and exitRight are direction-to-exit in bot-local coordinates.\n" +
+		"Steering policy: if exitForward > 0.15 set forward >= 0.7 and backward = 0; if exitForward < -0.15 set backward >= 0.45.\n" +
+		"Steering policy: if exitRight > 0.15 set right >= 0.55 and left = 0; if exitRight < -0.15 set left >= 0.55 and right = 0.\n" +
+		"If green ring is visible in image, prioritize centering it then move forward quickly.\n" +
+		"If green ring is NOT visible, keep exploring: speed >= 0.55 and use turn (left or right) plus some forward.\n" +
+		"Never output all movement axes as zero. Never output speed > 0 with zero movement axes.\n" +
+		"Avoid repeating the exact same action many ticks in a row; adapt using latest image and state.\n" +
 		"Example: {\"left\":0,\"right\":0,\"forward\":1,\"backward\":0,\"speed\":0.8}";
 
 	const userText = JSON.stringify(compactState);
@@ -261,10 +351,11 @@ async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState:
 	});
 	let actionObj: any = null;
 	try {
-		actionObj = extractJsonObject(String(content));
+		actionObj = extractJsonFromText(String(content));
 	} catch {
 		actionObj = null;
 	}
+	if (!actionObj) throw new Error("Failed to parse AI action from response");
 	return sanitizeAction(actionObj);
 }
 
@@ -279,16 +370,19 @@ function BabylonWorld({
 	paused,
 	onUi,
 	onVisionPreview,
+	onAiExchange,
 }: {
 	settings: Sim4Settings;
 	paused: boolean;
 	onUi: (snap: UiSnapshot) => void;
 	onVisionPreview: (dataUrl: string) => void;
+	onAiExchange: (exchange: AiExchange) => void;
 }) {
 	const canvasRef = useRef<HTMLCanvasElement | null>(null);
 	const settingsRef = useRef(settings);
 	const pausedRef = useRef(paused);
 	const onVisionPreviewRef = useRef(onVisionPreview);
+	const onAiExchangeRef = useRef(onAiExchange);
 
 	useEffect(() => {
 		settingsRef.current = settings;
@@ -299,6 +393,9 @@ function BabylonWorld({
 	useEffect(() => {
 		onVisionPreviewRef.current = onVisionPreview;
 	}, [onVisionPreview]);
+	useEffect(() => {
+		onAiExchangeRef.current = onAiExchange;
+	}, [onAiExchange]);
 
 	useEffect(() => {
 		if (!canvasRef.current) return;
@@ -363,15 +460,20 @@ function BabylonWorld({
 		wallE.isPickable = false;
 		wallE.material = wallMat;
 
-		// Exit marker
-		const exit = BABYLON.MeshBuilder.CreateTorus("exit", { diameter: EXIT_RADIUS * 2.2, thickness: 0.22, tessellation: 48 }, scene);
-		exit.position.set(EXIT_X, 0.12, EXIT_Z);
-		exit.rotation.x = Math.PI / 2;
+		// Exit marker (GTA-style checkpoint: hollow transparent green cylinder)
+		const checkpointHeight = 4.2;
+		const exit = BABYLON.MeshBuilder.CreateCylinder(
+			"exit",
+			{ diameter: EXIT_RADIUS * 2.4, height: checkpointHeight, tessellation: 56, cap: BABYLON.Mesh.NO_CAP },
+			scene,
+		);
+		exit.position.set(EXIT_X, checkpointHeight * 0.5, EXIT_Z);
 		exit.isPickable = false;
 		const exitMat = new BABYLON.StandardMaterial("exitMat", scene);
 		exitMat.emissiveColor = BABYLON.Color3.FromHexString("#22c55e");
-		exitMat.diffuseColor = BABYLON.Color3.FromHexString("#15803d");
-		exitMat.alpha = 0.8;
+		exitMat.diffuseColor = BABYLON.Color3.FromHexString("#16a34a");
+		exitMat.alpha = 0.3; // 70% transparent
+		exitMat.backFaceCulling = false; // visible from inside and outside
 		exit.material = exitMat;
 
 		// Procedural city obstacles (buildings as boxes + collision circles)
@@ -416,6 +518,20 @@ function BabylonWorld({
 		const head = BABYLON.MeshBuilder.CreateSphere("botHead", { diameter: 0.9, segments: 16 }, scene);
 		head.parent = botRoot;
 		head.position.y = 2.55;
+
+		// Loading indicator shown while waiting for AI response
+		const loadingRing = BABYLON.MeshBuilder.CreateTorus("botLoadingRing", { diameter: 1.0, thickness: 0.08, tessellation: 36 }, scene);
+		loadingRing.parent = botRoot;
+		loadingRing.position.y = 3.3;
+		loadingRing.rotation.x = Math.PI / 2;
+		loadingRing.isPickable = false;
+		const loadingMat = new BABYLON.StandardMaterial("loadingMat", scene);
+		loadingMat.emissiveColor = BABYLON.Color3.FromHexString("#22d3ee");
+		loadingMat.diffuseColor = BABYLON.Color3.FromHexString("#0e7490");
+		loadingMat.alpha = 0.9;
+		loadingMat.backFaceCulling = false;
+		loadingRing.material = loadingMat;
+		loadingRing.setEnabled(false);
 
 		const limbMat = new BABYLON.StandardMaterial("botMat", scene);
 		limbMat.diffuseColor = BABYLON.Color3.FromHexString("#e2e8f0");
@@ -797,12 +913,13 @@ function BabylonWorld({
 					lastAiAt = now;
 					pendingAi = true;
 					(void (async () => {
+						let asked = "";
 						try {
 							const cap = await captureVision(Math.round(clamp(s.visionResolution, 16, 96)));
 							if (cap?.dataUrl) onVisionPreviewRef.current(cap.dataUrl);
 							const visionUrl = cap?.dataUrl && cap.dataUrl.length > 0 ? cap.dataUrl : null;
 							const compactState = computeCompactState();
-
+							asked = JSON.stringify(compactState);
 							let action: AiAction;
 							if (s.aiProvider === "local" && s.localEndpointUrl.trim()) {
 								if (!localBootstrap.ready) {
@@ -821,10 +938,27 @@ function BabylonWorld({
 							} else {
 								action = defaultFallbackAction(bot);
 							}
-							currentAction = sanitizeAction(action);
-						} catch {
+							currentAction = ensureNonIdleAction(sanitizeAction(action), bot, compactState);
+							onAiExchangeRef.current({
+								id: randomId("ai"),
+								provider: s.aiProvider,
+								model: s.aiModel,
+								asked,
+								replied: JSON.stringify(currentAction),
+								at: Date.now(),
+							});
+						} catch (err: any) {
 							currentAction = defaultFallbackAction(bot);
-						} finally {
+							onAiExchangeRef.current({
+								id: randomId("ai"),
+								provider: s.aiProvider,
+								model: s.aiModel,
+								asked,
+								replied: JSON.stringify(currentAction),
+								at: Date.now(),
+								error: String((err as any)?.message ?? err ?? "Unknown error"),
+							});
+						 } finally {
 							pendingAi = false;
 						}
 					})());
@@ -849,170 +983,172 @@ function BabylonWorld({
 					})());
 				}
 
-				// Bot movement
-				const basis = computeBotHeadingBasis();
-				const ax = (currentAction.right - currentAction.left) * s.botAccel;
-				const az = (currentAction.forward - currentAction.backward) * s.botAccel;
-				let steerX = basis.r.x * ax + basis.h.x * az;
-				let steerZ = basis.r.z * ax + basis.h.z * az;
-				const steerMag = Math.sqrt(steerX * steerX + steerZ * steerZ);
-				if (steerMag > 1e-6) {
-					steerX /= steerMag;
-					steerZ /= steerMag;
-				}
-				const desiredMaxSpeed = s.botMaxSpeed * clamp(currentAction.speed, 0, 1);
-
-				let vx = bot.vx;
-				let vz = bot.vz;
-				let x = bot.x;
-				let z = bot.z;
-
-				// Sub-step to prevent tunneling through buildings.
-				const estSpeed = Math.sqrt(vx * vx + vz * vz);
-				const maxStepDist = Math.max(BOT_RADIUS * 0.75, 0.14);
-				const steps = clamp(Math.ceil((estSpeed * dt) / maxStepDist), 1, 18);
-				const dtStep = dt / steps;
-				const dragFactor = Math.pow(0.90, 1 / steps);
-
-				for (let i = 0; i < steps; i += 1) {
-					vx = (vx + steerX * s.botAccel * dtStep) * dragFactor;
-					vz = (vz + steerZ * s.botAccel * dtStep) * dragFactor;
-					const sp = Math.sqrt(vx * vx + vz * vz) || 1;
-					if (sp > Math.max(desiredMaxSpeed, 0.0001)) {
-						vx = (vx / sp) * desiredMaxSpeed;
-						vz = (vz / sp) * desiredMaxSpeed;
+				if (!pendingAi) {
+					// Bot movement
+					const basis = computeBotHeadingBasis();
+					const ax = (currentAction.right - currentAction.left) * s.botAccel;
+					const az = (currentAction.forward - currentAction.backward) * s.botAccel;
+					let steerX = basis.r.x * ax + basis.h.x * az;
+					let steerZ = basis.r.z * ax + basis.h.z * az;
+					const steerMag = Math.sqrt(steerX * steerX + steerZ * steerZ);
+					if (steerMag > 1e-6) {
+						steerX /= steerMag;
+						steerZ /= steerMag;
 					}
-					x = clamp(x + vx * dtStep, -HALF + BOT_RADIUS, HALF - BOT_RADIUS);
-					z = clamp(z + vz * dtStep, -HALF + BOT_RADIUS, HALF - BOT_RADIUS);
-					const resolved = resolveObstacleCollision(x, z, BOT_RADIUS);
-					x = resolved.x;
-					z = resolved.z;
-				}
+					const desiredMaxSpeed = s.botMaxSpeed * clamp(currentAction.speed, 0, 1);
 
-				bot.vx = vx;
-				bot.vz = vz;
-				bot.x = x;
-				bot.z = z;
+					let vx = bot.vx;
+					let vz = bot.vz;
+					let x = bot.x;
+					let z = bot.z;
 
-				const vmag = Math.sqrt(vx * vx + vz * vz);
-				if (vmag > 0.02) {
-					bot.headingX = vx / vmag;
-					bot.headingZ = vz / vmag;
-				}
+					// Sub-step to prevent tunneling through buildings.
+					const estSpeed = Math.sqrt(vx * vx + vz * vz);
+					const maxStepDist = Math.max(BOT_RADIUS * 0.75, 0.14);
+					const steps = clamp(Math.ceil((estSpeed * dt) / maxStepDist), 1, 18);
+					const dtStep = dt / steps;
+					const dragFactor = Math.pow(0.90, 1 / steps);
 
-				// Energy drain
-				bot.energy = clamp(bot.energy - s.energyDrainPerSec * (0.3 + vmag) * dt, 0, bot.maxEnergy);
-				if (bot.energy <= 0) bot.health = clamp(bot.health - 10 * dt, 0, bot.maxHealth);
+					for (let i = 0; i < steps; i += 1) {
+						vx = (vx + steerX * s.botAccel * dtStep) * dragFactor;
+						vz = (vz + steerZ * s.botAccel * dtStep) * dragFactor;
+						const sp = Math.sqrt(vx * vx + vz * vz) || 1;
+						if (sp > Math.max(desiredMaxSpeed, 0.0001)) {
+							vx = (vx / sp) * desiredMaxSpeed;
+							vz = (vz / sp) * desiredMaxSpeed;
+						}
+						x = clamp(x + vx * dtStep, -HALF + BOT_RADIUS, HALF - BOT_RADIUS);
+						z = clamp(z + vz * dtStep, -HALF + BOT_RADIUS, HALF - BOT_RADIUS);
+						const resolved = resolveObstacleCollision(x, z, BOT_RADIUS);
+						x = resolved.x;
+						z = resolved.z;
+					}
 
-				// Actions: grow organ, pick, throw
-				if (currentAction.grow && bot.organs < 4 && bot.energy > bot.maxEnergy * 0.25) {
-					bot.organs += 1;
-					bot.maxEnergy += 18;
-					bot.maxHealth += 12;
-					bot.energy = clamp(bot.energy - 12, 0, bot.maxEnergy);
-					const organ = BABYLON.MeshBuilder.CreateSphere(`organ-${bot.organs}`, { diameter: 0.35, segments: 10 }, scene);
-					organ.parent = torso;
-					organ.position.set(rand(-0.6, 0.6), rand(-0.5, 0.5), rand(-0.25, 0.25));
-					organ.material = limbMat;
-					organ.isPickable = false;
-				}
+					bot.vx = vx;
+					bot.vz = vz;
+					bot.x = x;
+					bot.z = z;
 
-				if (currentAction.pick) {
-					const held = rocks.some((r) => r.heldByBot && r.active);
-					if (!held) {
-						let best: Rock | null = null;
-						let bestD = Number.POSITIVE_INFINITY;
-						for (const r of rocks) {
-							if (!r.active || r.heldByBot) continue;
-							const d = dist2({ x: bot.x, z: bot.z }, { x: r.x, z: r.z });
-							if (d < bestD) {
-								bestD = d;
-								best = r;
+					const vmag = Math.sqrt(vx * vx + vz * vz);
+					if (vmag > 0.02) {
+						bot.headingX = vx / vmag;
+						bot.headingZ = vz / vmag;
+					}
+
+					// Energy drain
+					bot.energy = clamp(bot.energy - s.energyDrainPerSec * (0.3 + vmag) * dt, 0, bot.maxEnergy);
+					if (bot.energy <= 0) bot.health = clamp(bot.health - 10 * dt, 0, bot.maxHealth);
+
+					// Actions: grow organ, pick, throw
+					if (currentAction.grow && bot.organs < 4 && bot.energy > bot.maxEnergy * 0.25) {
+						bot.organs += 1;
+						bot.maxEnergy += 18;
+						bot.maxHealth += 12;
+						bot.energy = clamp(bot.energy - 12, 0, bot.maxEnergy);
+						const organ = BABYLON.MeshBuilder.CreateSphere(`organ-${bot.organs}`, { diameter: 0.35, segments: 10 }, scene);
+						organ.parent = torso;
+						organ.position.set(rand(-0.6, 0.6), rand(-0.5, 0.5), rand(-0.25, 0.25));
+						organ.material = limbMat;
+						organ.isPickable = false;
+					}
+
+					if (currentAction.pick) {
+						const held = rocks.some((r) => r.heldByBot && r.active);
+						if (!held) {
+							let best: Rock | null = null;
+							let bestD = Number.POSITIVE_INFINITY;
+							for (const r of rocks) {
+								if (!r.active || r.heldByBot) continue;
+								const d = dist2({ x: bot.x, z: bot.z }, { x: r.x, z: r.z });
+								if (d < bestD) {
+									bestD = d;
+									best = r;
+								}
+							}
+							if (best && bestD < 2.2 * 2.2) {
+								best.heldByBot = true;
+								best.vx = 0;
+								best.vz = 0;
 							}
 						}
-						if (best && bestD < 2.2 * 2.2) {
-							best.heldByBot = true;
-							best.vx = 0;
-							best.vz = 0;
+					}
+
+					if (currentAction.throw) {
+						const heldRock = rocks.find((r) => r.active && r.heldByBot);
+						if (heldRock) {
+							heldRock.heldByBot = false;
+							heldRock.x = bot.x + bot.headingX * 1.2;
+							heldRock.z = bot.z + bot.headingZ * 1.2;
+							heldRock.vx = bot.headingX * 16;
+							heldRock.vz = bot.headingZ * 16;
+							bot.energy = clamp(bot.energy - 3.5, 0, bot.maxEnergy);
 						}
 					}
-				}
 
-				if (currentAction.throw) {
-					const heldRock = rocks.find((r) => r.active && r.heldByBot);
-					if (heldRock) {
-						heldRock.heldByBot = false;
-						heldRock.x = bot.x + bot.headingX * 1.2;
-						heldRock.z = bot.z + bot.headingZ * 1.2;
-						heldRock.vx = bot.headingX * 16;
-						heldRock.vz = bot.headingZ * 16;
-						bot.energy = clamp(bot.energy - 3.5, 0, bot.maxEnergy);
-					}
-				}
-
-				// Enemies chase and damage on collision
-				for (const e of enemies) {
-					if (!e.alive) continue;
-					const toBot = normalize(bot.x - e.x, bot.z - e.z);
-					let ex = e.x;
-					let ez = e.z;
-					let evx = (e.vx + toBot.x * s.enemySpeed * 2.2 * dt) * 0.86;
-					let evz = (e.vz + toBot.z * s.enemySpeed * 2.2 * dt) * 0.86;
-					const esp = Math.sqrt(evx * evx + evz * evz) || 1;
-					if (esp > s.enemySpeed) {
-						evx = (evx / esp) * s.enemySpeed;
-						evz = (evz / esp) * s.enemySpeed;
-					}
-
-					// Sub-step enemy vs buildings
-					const maxEDist = Math.max(ENEMY_RADIUS * 0.75, 0.14);
-					const stepsE = clamp(Math.ceil((esp * dt) / maxEDist), 1, 12);
-					const dtE = dt / stepsE;
-					for (let si = 0; si < stepsE; si += 1) {
-						ex = clamp(ex + evx * dtE, -HALF + ENEMY_RADIUS, HALF - ENEMY_RADIUS);
-						ez = clamp(ez + evz * dtE, -HALF + ENEMY_RADIUS, HALF - ENEMY_RADIUS);
-						const resolved = resolveObstacleCollision(ex, ez, ENEMY_RADIUS);
-						ex = resolved.x;
-						ez = resolved.z;
-					}
-
-					e.x = ex;
-					e.z = ez;
-					e.vx = evx;
-					e.vz = evz;
-
-					const hit = dist2({ x: bot.x, z: bot.z }, { x: e.x, z: e.z }) < (BOT_RADIUS + ENEMY_RADIUS) ** 2;
-					if (hit) {
-						bot.health = clamp(bot.health - s.enemyDamagePerSec * dt, 0, bot.maxHealth);
-					}
-				}
-
-				// Rocks move + collide with enemies
-				for (const r of rocks) {
-					if (!r.active || r.heldByBot) continue;
-					r.x = clamp(r.x + r.vx * dt, -HALF + ROCK_RADIUS, HALF - ROCK_RADIUS);
-					r.z = clamp(r.z + r.vz * dt, -HALF + ROCK_RADIUS, HALF - ROCK_RADIUS);
-					r.vx *= 0.93;
-					r.vz *= 0.93;
-					// Stop if slow
-					if (Math.abs(r.vx) + Math.abs(r.vz) < 0.05) {
-						r.vx = 0;
-						r.vz = 0;
-					}
-
+					// Enemies chase and damage on collision
 					for (const e of enemies) {
 						if (!e.alive) continue;
-						if (dist2({ x: r.x, z: r.z }, { x: e.x, z: e.z }) < (ROCK_RADIUS + ENEMY_RADIUS) ** 2) {
-							e.alive = false;
-							r.active = false;
-							bot.energy = clamp(bot.energy + 6, 0, bot.maxEnergy);
+						const toBot = normalize(bot.x - e.x, bot.z - e.z);
+						let ex = e.x;
+						let ez = e.z;
+						let evx = (e.vx + toBot.x * s.enemySpeed * 2.2 * dt) * 0.86;
+						let evz = (e.vz + toBot.z * s.enemySpeed * 2.2 * dt) * 0.86;
+						const esp = Math.sqrt(evx * evx + evz * evz) || 1;
+						if (esp > s.enemySpeed) {
+							evx = (evx / esp) * s.enemySpeed;
+							evz = (evz / esp) * s.enemySpeed;
+						}
+
+						// Sub-step enemy vs buildings
+						const maxEDist = Math.max(ENEMY_RADIUS * 0.75, 0.14);
+						const stepsE = clamp(Math.ceil((esp * dt) / maxEDist), 1, 12);
+						const dtE = dt / stepsE;
+						for (let si = 0; si < stepsE; si += 1) {
+							ex = clamp(ex + evx * dtE, -HALF + ENEMY_RADIUS, HALF - ENEMY_RADIUS);
+							ez = clamp(ez + evz * dtE, -HALF + ENEMY_RADIUS, HALF - ENEMY_RADIUS);
+							const resolved = resolveObstacleCollision(ex, ez, ENEMY_RADIUS);
+							ex = resolved.x;
+							ez = resolved.z;
+						}
+
+						e.x = ex;
+						e.z = ez;
+						e.vx = evx;
+						e.vz = evz;
+
+						const hit = dist2({ x: bot.x, z: bot.z }, { x: e.x, z: e.z }) < (BOT_RADIUS + ENEMY_RADIUS) ** 2;
+						if (hit) {
+							bot.health = clamp(bot.health - s.enemyDamagePerSec * dt, 0, bot.maxHealth);
 						}
 					}
-				}
 
-				// Escape check
-				if (dist2({ x: bot.x, z: bot.z }, { x: EXIT_X, z: EXIT_Z }) < EXIT_RADIUS * EXIT_RADIUS) {
-					bot.escaped = true;
+					// Rocks move + collide with enemies
+					for (const r of rocks) {
+						if (!r.active || r.heldByBot) continue;
+						r.x = clamp(r.x + r.vx * dt, -HALF + ROCK_RADIUS, HALF - ROCK_RADIUS);
+						r.z = clamp(r.z + r.vz * dt, -HALF + ROCK_RADIUS, HALF - ROCK_RADIUS);
+						r.vx *= 0.93;
+						r.vz *= 0.93;
+						// Stop if slow
+						if (Math.abs(r.vx) + Math.abs(r.vz) < 0.05) {
+							r.vx = 0;
+							r.vz = 0;
+						}
+
+						for (const e of enemies) {
+							if (!e.alive) continue;
+							if (dist2({ x: r.x, z: r.z }, { x: e.x, z: e.z }) < (ROCK_RADIUS + ENEMY_RADIUS) ** 2) {
+								e.alive = false;
+								r.active = false;
+								bot.energy = clamp(bot.energy + 6, 0, bot.maxEnergy);
+							}
+						}
+					}
+
+					// Escape check
+					if (dist2({ x: bot.x, z: bot.z }, { x: EXIT_X, z: EXIT_Z }) < EXIT_RADIUS * EXIT_RADIUS) {
+						bot.escaped = true;
+					}
 				}
 			}
 
@@ -1026,6 +1162,12 @@ function BabylonWorld({
 			rightLeg.pivot.rotation.x = -Math.sin(t) * 0.8 * swing;
 			leftArm.pivot.rotation.x = -Math.sin(t) * 0.6 * swing;
 			rightArm.pivot.rotation.x = Math.sin(t) * 0.6 * swing;
+
+			const showLoadingRing = pendingAi && !pausedRef.current && !bot.escaped && bot.health > 0;
+			loadingRing.setEnabled(showLoadingRing);
+			if (showLoadingRing) {
+				loadingRing.rotation.y += dt * 8;
+			}
 
 			syncEnemies();
 			syncRocks();
@@ -1043,6 +1185,8 @@ function BabylonWorld({
 						? "Dead"
 						: pausedRef.current
 							? "Paused"
+							: pendingAi
+								? "Waiting for AI..."
 							: settingsRef.current.aiProvider === "none"
 								? "No AI configured (fallback running)"
 								: `Running${localHint}${imgHint}`;
@@ -1095,6 +1239,8 @@ export default function CityEscapeSim3D() {
 	const [paused, setPaused] = useState(false);
 	const [controlsCollapsed, setControlsCollapsed] = useState(false);
 	const [visionPreviewUrl, setVisionPreviewUrl] = useState<string>("");
+	const [aiLog, setAiLog] = useState<AiExchange[]>([]);
+	const prevAiExchangeRef = useRef<AiExchange | null>(null);
 	const [ui, setUi] = useState<UiSnapshot>(() => ({
 		health: 100,
 		energy: 100,
@@ -1108,11 +1254,103 @@ export default function CityEscapeSim3D() {
 
 	const restart = () => {
 		window.dispatchEvent(new Event("sim4-reset"));
+		prevAiExchangeRef.current = null;
+		setAiLog([]);
+	};
+
+	const pushAiExchange = (exchange: AiExchange) => {
+		setAiLog((prev) => {
+			prevAiExchangeRef.current = prev[0] ?? null;
+			return [exchange];
+		});
 	};
 
 	return (
 		<>
-			<BabylonWorld settings={settings} paused={paused} onUi={setUi} onVisionPreview={setVisionPreviewUrl} />
+			<BabylonWorld settings={settings} paused={paused} onUi={setUi} onVisionPreview={setVisionPreviewUrl} onAiExchange={pushAiExchange} />
+			<aside className="selected-panel">
+				<Card className="bg-transparent border-0 shadow-none">
+					<div className="controls-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
+						<span>Gemma Chat</span>
+						<span className="text-xs text-slate-300">latest only</span>
+					</div>
+					<CardContent className="space-y-3">
+						{aiLog.length === 0 ? (
+							<div className="rounded-xl border border-slate-700 p-3 text-xs text-slate-300">Waiting for first AI exchange...</div>
+						) : (
+							<div className="max-h-[62vh] overflow-auto space-y-2 pr-1">
+								{aiLog.map((item) => {
+									let askedObj: Record<string, any> = {};
+									let repliedObj: Record<string, any> = {};
+									let prevAskedObj: Record<string, any> = {};
+									let prevRepliedObj: Record<string, any> = {};
+									try { askedObj = JSON.parse(item.asked); } catch { askedObj = { raw: item.asked }; }
+									try { repliedObj = JSON.parse(item.replied); } catch { repliedObj = { raw: item.replied }; }
+									if (prevAiExchangeRef.current) {
+										try { prevAskedObj = JSON.parse(prevAiExchangeRef.current.asked); } catch { prevAskedObj = {}; }
+										try { prevRepliedObj = JSON.parse(prevAiExchangeRef.current.replied); } catch { prevRepliedObj = {}; }
+									}
+									const fmtVal = (v: any) => {
+										if (typeof v === "boolean") return v ? "✓" : "✗";
+										if (typeof v === "number") return Number.isFinite(v) ? (Number.isInteger(v) ? String(v) : v.toFixed(3)) : "—";
+										if (v === null || v === undefined) return "—";
+										return String(v);
+									};
+									const changedClass = (prevObj: Record<string, any>, key: string, value: any) => {
+										if (!Object.prototype.hasOwnProperty.call(prevObj, key)) return "";
+										return fmtVal(prevObj[key]) !== fmtVal(value) ? " text-emerald-300" : "";
+									};
+									return (
+										<div key={item.id} className="rounded-xl border border-slate-700 p-2 text-xs space-y-2 text-left">
+											<div className="flex items-center justify-between gap-1 text-slate-400">
+												<span>
+												{new Date(item.at).toLocaleTimeString()} · {item.provider}/{item.model}
+												</span>
+												{item.error && <span className="text-red-400 text-[10px] font-medium">AI error · fallback used</span>}
+											</div>
+											{item.error && (
+												<div className="rounded-md border border-red-900/60 bg-red-950/30 px-2 py-1 text-[11px] text-red-300 break-words">{item.error}</div>
+											)}
+											<div className="grid grid-cols-2 gap-2 items-start">
+												<div>
+													<div className="font-semibold text-slate-200 mb-1">State sent</div>
+													<div className="rounded-md border border-slate-700 bg-slate-950/50 p-2 text-left">
+														<table className="w-full table-fixed border-collapse text-left">
+															<tbody>
+																{Object.entries(askedObj).map(([k, v]) => (
+																	<tr key={k} className="align-top">
+																		<th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal break-words">{k}</th>
+																		<td className={`py-[2px] text-slate-100 font-mono break-words${changedClass(prevAskedObj, k, v)}`}>{fmtVal(v)}</td>
+																	</tr>
+																))}
+															</tbody>
+														</table>
+													</div>
+												</div>
+												<div>
+													<div className="font-semibold text-slate-200 mb-1">Action</div>
+													<div className="rounded-md border border-slate-700 bg-slate-950/50 p-2 text-left">
+														<table className="w-full table-fixed border-collapse text-left">
+															<tbody>
+																{Object.entries(repliedObj).map(([k, v]) => (
+																	<tr key={k} className="align-top">
+																		<th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal break-words">{k}</th>
+																		<td className={`py-[2px] text-slate-100 font-mono break-words${changedClass(prevRepliedObj, k, v)}`}>{fmtVal(v)}</td>
+																	</tr>
+																))}
+															</tbody>
+														</table>
+													</div>
+												</div>
+											</div>
+										</div>
+									);
+								})}
+							</div>
+						)}
+					</CardContent>
+				</Card>
+			</aside>
 			<aside className="controls-panel">
 				<Card className="bg-transparent border-0 shadow-none">
 					<div className="controls-title" style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 12 }}>
