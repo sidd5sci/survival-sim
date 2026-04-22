@@ -25,6 +25,41 @@ function normalize2D(x, z) {
   return { x: x / l, z: z / l };
 }
 
+function resolveCircleAabbCollision(x, z, radius, obstacle) {
+  const minX = obstacle.x - obstacle.size;
+  const maxX = obstacle.x + obstacle.size;
+  const minZ = obstacle.z - obstacle.size;
+  const maxZ = obstacle.z + obstacle.size;
+
+  const closestX = clamp(x, minX, maxX);
+  const closestZ = clamp(z, minZ, maxZ);
+  const dx = x - closestX;
+  const dz = z - closestZ;
+  const d2 = dx * dx + dz * dz;
+  const r2 = radius * radius;
+
+  if (d2 >= r2) return { x, z, collided: false };
+
+  if (d2 > 1e-10) {
+    const d = Math.sqrt(d2);
+    const push = radius - d;
+    const nx = dx / d;
+    const nz = dz / d;
+    return { x: x + nx * push, z: z + nz * push, collided: true };
+  }
+
+  const left = x - minX;
+  const right = maxX - x;
+  const top = z - minZ;
+  const bottom = maxZ - z;
+  const minPen = Math.min(left, right, top, bottom);
+
+  if (minPen === left) return { x: minX - radius, z, collided: true };
+  if (minPen === right) return { x: maxX + radius, z, collided: true };
+  if (minPen === top) return { x, z: minZ - radius, collided: true };
+  return { x, z: maxZ + radius, collided: true };
+}
+
 function repelFromObstacles(entity, obstacles, radius = 1.2) {
   let rx = 0;
   let rz = 0;
@@ -272,13 +307,10 @@ function useSimulation() {
         nextZ = clamp(nextZ, -HALF + 1, HALF - 1);
 
         for (const o of obstacles) {
-          const dx = nextX - o.x;
-          const dz = nextZ - o.z;
-          const d = Math.sqrt(dx * dx + dz * dz) || 0.001;
-          const minD = o.size + BOT_RADIUS;
-          if (d < minD) {
-            nextX = o.x + (dx / d) * minD;
-            nextZ = o.z + (dz / d) * minD;
+          const resolved = resolveCircleAabbCollision(nextX, nextZ, BOT_RADIUS, o);
+          if (resolved.collided) {
+            nextX = resolved.x;
+            nextZ = resolved.z;
           }
         }
 
@@ -332,13 +364,10 @@ function useSimulation() {
         nx = clamp(nx, -HALF + 1, HALF - 1);
         nz = clamp(nz, -HALF + 1, HALF - 1);
         for (const o of obstacles) {
-          const odx = nx - o.x;
-          const odz = nz - o.z;
-          const d = Math.sqrt(odx * odx + odz * odz) || 0.001;
-          const minD = o.size + ENEMY_RADIUS;
-          if (d < minD) {
-            nx = o.x + (odx / d) * minD;
-            nz = o.z + (odz / d) * minD;
+          const resolved = resolveCircleAabbCollision(nx, nz, ENEMY_RADIUS, o);
+          if (resolved.collided) {
+            nx = resolved.x;
+            nz = resolved.z;
           }
         }
         return { ...e, x: nx, z: nz, vx: dir.x * enemySpeed, vz: dir.z * enemySpeed };

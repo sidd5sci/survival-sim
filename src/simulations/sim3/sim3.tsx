@@ -198,6 +198,46 @@ function cellIndex(x: number, z: number): number {
     return cz * GRID_CELLS + cx;
 }
 
+function resolveCircleAabbCollision(
+    x: number,
+    z: number,
+    radius: number,
+    obstacle: Obstacle,
+): { x: number; z: number; collided: boolean } {
+    const minX = obstacle.x - obstacle.size;
+    const maxX = obstacle.x + obstacle.size;
+    const minZ = obstacle.z - obstacle.size;
+    const maxZ = obstacle.z + obstacle.size;
+
+    const closestX = clamp(x, minX, maxX);
+    const closestZ = clamp(z, minZ, maxZ);
+    const dx = x - closestX;
+    const dz = z - closestZ;
+    const d2 = dx * dx + dz * dz;
+    const r2 = radius * radius;
+
+    if (d2 >= r2) return { x, z, collided: false };
+
+    if (d2 > 1e-10) {
+        const d = Math.sqrt(d2);
+        const push = radius - d;
+        const nx = dx / d;
+        const nz = dz / d;
+        return { x: x + nx * push, z: z + nz * push, collided: true };
+    }
+
+    const left = x - minX;
+    const right = maxX - x;
+    const top = z - minZ;
+    const bottom = maxZ - z;
+    const minPen = Math.min(left, right, top, bottom);
+
+    if (minPen === left) return { x: minX - radius, z, collided: true };
+    if (minPen === right) return { x: maxX + radius, z, collided: true };
+    if (minPen === top) return { x, z: minZ - radius, collided: true };
+    return { x, z: maxZ + radius, collided: true };
+}
+
 function randomId(prefix: string): string {
     return `${prefix}-${crypto.randomUUID()}`;
 }
@@ -1024,13 +1064,10 @@ function stepSimulation(prev: SimState, dt: number, settings: EvoSettings, start
             }
 
             for (const obstacle of prev.obstacles) {
-                const dx = x - obstacle.x;
-                const dz = z - obstacle.z;
-                const d = Math.sqrt(dx * dx + dz * dz) || 0.0001;
-                const minD = obstacle.size + AGENT_RADIUS;
-                if (d < minD) {
-                    x = obstacle.x + (dx / d) * minD;
-                    z = obstacle.z + (dz / d) * minD;
+                const resolved = resolveCircleAabbCollision(x, z, AGENT_RADIUS, obstacle);
+                if (resolved.collided) {
+                    x = resolved.x;
+                    z = resolved.z;
                     collidedThisStep = true;
                 }
             }
