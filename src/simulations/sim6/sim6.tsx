@@ -61,6 +61,7 @@ type BotAgent = {
 	prevHeadingZ: number;
 	enemyKills: number;
 	directionChanges: number;
+	deathPenaltyApplied: boolean;
 };
 
 type AiProvider = "genetic" | "local" | "replicate" | "none";
@@ -75,6 +76,7 @@ type Sim4Settings = {
 	replicateModel: string;
 	visionResolution: number;
 	aiHz: number;
+	generationSeconds: number;
 	enemySpeed: number;
 	enemyDamagePerSec: number;
 	botMaxSpeed: number;
@@ -115,6 +117,7 @@ type SelectedBotSnapshot = {
 	enemyKills: number;
 	directionChanges: number;
 	action: AiAction;
+	heading: { x: number; z: number; yawDeg: number };
 	position: { x: number; z: number };
 };
 
@@ -162,6 +165,7 @@ const EXIT_Z = HALF - 6;
 const EXIT_RADIUS = 3.0;
 const BOT_COUNT = 10;
 const ELITE_COUNT = 3;
+const TOP_GREEN_COUNT = 4;
 
 function clamp(v: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, v));
@@ -221,6 +225,28 @@ type Genome = {
 	id: string;
 	net: DenseNet;
 	fitness: number;
+};
+
+type SerializedDenseNet = {
+	inputSize: number;
+	h1Size: number;
+	h2Size: number;
+	outputSize: number;
+	w1: number[];
+	b1: number[];
+	w2: number[];
+	b2: number[];
+	w3: number[];
+	b3: number[];
+};
+
+type SerializedGeneration = {
+	version: 1;
+	sim: "sim6";
+	generation: number;
+	botCount: number;
+	inputSize: number;
+	genomes: Array<{ id: string; fitness: number; net: SerializedDenseNet }>;
 };
 
 const VISION_FEATURE_DIM = 16;
@@ -308,6 +334,46 @@ function cloneDenseNet(src: DenseNet): DenseNet {
 		w3: new Float32Array(src.w3),
 		b3: new Float32Array(src.b3),
 	};
+}
+
+function serializeDenseNet(net: DenseNet): SerializedDenseNet {
+	return {
+		inputSize: net.inputSize,
+		h1Size: net.h1Size,
+		h2Size: net.h2Size,
+		outputSize: net.outputSize,
+		w1: Array.from(net.w1),
+		b1: Array.from(net.b1),
+		w2: Array.from(net.w2),
+		b2: Array.from(net.b2),
+		w3: Array.from(net.w3),
+		b3: Array.from(net.b3),
+	};
+}
+
+function deserializeDenseNet(data: SerializedDenseNet, fallbackInputSize: number): DenseNet {
+	const inputSize = Number.isFinite(data?.inputSize) ? data.inputSize : fallbackInputSize;
+	const h1Size = Number.isFinite(data?.h1Size) ? data.h1Size : 128;
+	const h2Size = Number.isFinite(data?.h2Size) ? data.h2Size : 64;
+	const outputSize = Number.isFinite(data?.outputSize) ? data.outputSize : ACTION_OUTPUT_COUNT;
+	const net = createDenseNet(inputSize, h1Size, h2Size, outputSize);
+
+	const assignArray = (dst: Float32Array, src?: number[]) => {
+		if (!Array.isArray(src)) return;
+		const n = Math.min(dst.length, src.length);
+		for (let i = 0; i < n; i += 1) {
+			const v = Number(src[i]);
+			dst[i] = Number.isFinite(v) ? v : dst[i];
+		}
+	};
+
+	assignArray(net.w1, data?.w1);
+	assignArray(net.b1, data?.b1);
+	assignArray(net.w2, data?.w2);
+	assignArray(net.b2, data?.b2);
+	assignArray(net.w3, data?.w3);
+	assignArray(net.b3, data?.b3);
+	return net;
 }
 
 function mutateDenseNet(src: DenseNet, mutationRate = 0.1, mutationStrength = 0.2): DenseNet {
@@ -902,14 +968,26 @@ function BabylonWorld({
 		botMat.diffuseColor = BABYLON.Color3.FromHexString("#e2e8f0");
 		botMat.emissiveColor = BABYLON.Color3.FromHexString("#0f172a");
 		const championMat = new BABYLON.StandardMaterial("championMat", scene);
-		championMat.diffuseColor = BABYLON.Color3.FromHexString("#facc15");
-		championMat.emissiveColor = BABYLON.Color3.FromHexString("#422006");
+		championMat.diffuseColor = BABYLON.Color3.FromHexString("#22c55e");
+		championMat.emissiveColor = BABYLON.Color3.FromHexString("#14532d");
+		const selectedMat = new BABYLON.StandardMaterial("selectedMat", scene);
+		selectedMat.diffuseColor = BABYLON.Color3.FromHexString("#3b82f6");
+		selectedMat.emissiveColor = BABYLON.Color3.FromHexString("#1e3a8a");
+		const dirMat = new BABYLON.StandardMaterial("dirMat", scene);
+		dirMat.diffuseColor = BABYLON.Color3.FromHexString("#f8fafc");
+		dirMat.emissiveColor = BABYLON.Color3.FromHexString("#38bdf8");
 
 		for (let i = 0; i < BOT_COUNT; i += 1) {
 			const mesh = BABYLON.MeshBuilder.CreateCapsule(`bot-${i}`, { radius: 0.45, height: 2.2, tessellation: 8 }, scene);
 			mesh.material = botMat;
-			mesh.isPickable = false;
+			mesh.isPickable = true;
 			mesh.metadata = { botIndex: i };
+			const dir = BABYLON.MeshBuilder.CreateCylinder(`bot-dir-${i}`, { diameterTop: 0, diameterBottom: 0.2, height: 0.45, tessellation: 8 }, scene);
+			dir.parent = mesh;
+			dir.position.set(0, 0.75, 0.72);
+			dir.rotation.x = Math.PI / 2;
+			dir.isPickable = false;
+			dir.material = dirMat;
 			const spawnX = -HALF + 6 + (i % 5) * 1.6;
 			const spawnZ = -HALF + 6 + Math.floor(i / 5) * 1.6;
 			const bot: Bot = {
@@ -937,6 +1015,7 @@ function BabylonWorld({
 				prevHeadingZ: bot.headingZ,
 				enemyKills: 0,
 				directionChanges: 0,
+				deathPenaltyApplied: false,
 			});
 		}
 
@@ -1047,6 +1126,7 @@ function BabylonWorld({
 		const emitSelectedBotSnapshot = () => {
 			const a = botAgents[selectedBotIdx] ?? botAgents[0];
 			if (!a) return;
+			const yawDeg = Math.atan2(a.bot.headingX, a.bot.headingZ) * (180 / Math.PI);
 			onSelectedBotUpdateRef.current({
 				index: selectedBotIdx,
 				id: a.id,
@@ -1059,6 +1139,7 @@ function BabylonWorld({
 				enemyKills: a.enemyKills,
 				directionChanges: a.directionChanges,
 				action: a.action,
+				heading: { x: a.bot.headingX, z: a.bot.headingZ, yawDeg },
 				position: { x: a.bot.x, z: a.bot.z },
 			});
 		};
@@ -1249,6 +1330,7 @@ function BabylonWorld({
 				a.prevHeadingZ = b.headingZ;
 				a.enemyKills = 0;
 				a.directionChanges = 0;
+				a.deathPenaltyApplied = false;
 			}
 			enemies.length = 0;
 			for (const e of enemyMeshes.values()) e.dispose();
@@ -1281,6 +1363,58 @@ function BabylonWorld({
 		let generation = 1;
 		let evalStartAt = performance.now();
 		let generationBestIdx = 0;
+		let topGreenIdxSet = new Set<number>([0]);
+
+		const buildGenerationPayload = (): SerializedGeneration => ({
+			version: 1,
+			sim: "sim6",
+			generation,
+			botCount: population.length,
+			inputSize,
+			genomes: population.map((g) => ({
+				id: g.id,
+				fitness: g.fitness,
+				net: serializeDenseNet(g.net),
+			})),
+		});
+
+		const normalizeLoadedPopulation = (loaded: Genome[]): Genome[] => {
+			const next: Genome[] = [];
+			for (let i = 0; i < BOT_COUNT; i += 1) {
+				const src = loaded[i] ?? loaded[0];
+				if (src) {
+					next.push({ id: randomId("g"), net: cloneDenseNet(src.net), fitness: 0 });
+				} else {
+					next.push({ id: randomId("g"), net: createDenseNet(inputSize), fitness: 0 });
+				}
+			}
+			return next;
+		};
+
+		const exportHandler = (event: Event) => {
+			const onData = (event as CustomEvent<{ onData?: (payload: SerializedGeneration) => void }>).detail?.onData;
+			if (typeof onData === "function") onData(buildGenerationPayload());
+		};
+
+		const loadHandler = (event: Event) => {
+			const payload = (event as CustomEvent<{ payload?: SerializedGeneration }>).detail?.payload;
+			if (!payload || payload.sim !== "sim6" || !Array.isArray(payload.genomes)) return;
+			const loaded = payload.genomes.map((g) => ({
+				id: randomId("g"),
+				net: deserializeDenseNet(g.net, inputSize),
+				fitness: 0,
+			}));
+			population = normalizeLoadedPopulation(loaded);
+			generation = Math.max(1, Number(payload.generation) || 1);
+			generationBestIdx = 0;
+			selectedBotIdx = 0;
+			evalStartAt = performance.now();
+			resetWorld();
+			emitSelectedBotSnapshot();
+		};
+
+		window.addEventListener("sim6-export-generation", exportHandler as EventListener);
+		window.addEventListener("sim6-load-generation", loadHandler as EventListener);
 
 		// Local AI bootstrap (load/download model once, then run inference calls without re-checking every tick).
 		const localBootstrap = {
@@ -1416,6 +1550,7 @@ function BabylonWorld({
 								.map((a, i) => ({ i, f: a.fitness }))
 								.sort((a, b) => b.f - a.f);
 							generationBestIdx = ranked[0]?.i ?? 0;
+							topGreenIdxSet = new Set(ranked.slice(0, TOP_GREEN_COUNT).map((r) => r.i));
 
 							const focusIdx = traces.has(selectedBotIdx) ? selectedBotIdx : generationBestIdx;
 							const bestGenome = population[focusIdx];
@@ -1454,12 +1589,13 @@ function BabylonWorld({
 
 							const evalSeconds = (performance.now() - evalStartAt) / 1000;
 							const allTerminal = botAgents.every((a) => a.bot.health <= 0 || a.bot.escaped);
-							const shouldAdvance = allTerminal || evalSeconds > 22;
+							const shouldAdvance = allTerminal || evalSeconds > Math.max(5, s.generationSeconds);
 							if (shouldAdvance) {
 								for (let i = 0; i < botAgents.length; i += 1) population[i].fitness = botAgents[i].fitness;
 								population = evolvePopulation(population, ELITE_COUNT);
 								generation += 1;
 								generationBestIdx = 0;
+								topGreenIdxSet = new Set<number>([0]);
 								selectedBotIdx = 0;
 								evalStartAt = performance.now();
 								resetWorld();
@@ -1579,8 +1715,13 @@ function BabylonWorld({
 							bot.headingZ = vz / vmag;
 						}
 
-						bot.energy = clamp(bot.energy - s.energyDrainPerSec * (0.3 + vmag) * dt, 0, bot.maxEnergy);
+						bot.energy = clamp(bot.energy - s.energyDrainPerSec * (0.15 + vmag * 0.45) * dt, 0, bot.maxEnergy);
 						if (bot.energy <= 0) bot.health = clamp(bot.health - 10 * dt, 0, bot.maxHealth);
+						if (bot.health <= 0 && !agent.deathPenaltyApplied) {
+							agent.deathPenaltyApplied = true;
+							agent.fitness -= 50;
+							population[i].fitness = agent.fitness;
+						}
 
 						if (dist2({ x: bot.x, z: bot.z }, { x: EXIT_X, z: EXIT_Z }) < EXIT_RADIUS * EXIT_RADIUS) {
 							bot.escaped = true;
@@ -1665,7 +1806,7 @@ function BabylonWorld({
 				const a = botAgents[i];
 				a.mesh.position.set(a.bot.x, 1.1, a.bot.z);
 				a.mesh.rotation.y = Math.atan2(a.bot.headingX, a.bot.headingZ);
-				a.mesh.material = i === generationBestIdx ? championMat : botMat;
+				a.mesh.material = i === selectedBotIdx ? selectedMat : topGreenIdxSet.has(i) ? championMat : botMat;
 			}
 
 			syncEnemies();
@@ -1714,6 +1855,8 @@ function BabylonWorld({
 		return () => {
 			window.removeEventListener("resize", onResize);
 			window.removeEventListener("sim4-reset", resetHandler as any);
+			window.removeEventListener("sim6-export-generation", exportHandler as EventListener);
+			window.removeEventListener("sim6-load-generation", loadHandler as EventListener);
 			window.removeEventListener("keydown", keySpawnHandler);
 			engine.dispose();
 		};
@@ -1844,11 +1987,12 @@ export default function CityEscapeGeneticSim3D() {
 		replicateModel: "",
 		visionResolution: 64,
 		aiHz: 2,
+		generationSeconds: 300,
 		enemySpeed: 3.2,
 		enemyDamagePerSec: 14,
 		botMaxSpeed: 6,
 		botAccel: 10,
-		energyDrainPerSec: 0.55,
+		energyDrainPerSec: 0.3,
 	});
 	const [paused, setPaused] = useState(false);
 	const [controlsCollapsed, setControlsCollapsed] = useState(false);
@@ -1856,6 +2000,8 @@ export default function CityEscapeGeneticSim3D() {
 	const [aiLog, setAiLog] = useState<AiExchange[]>([]);
 	const [nnSnapshot, setNnSnapshot] = useState<NeuralNetSnapshot | null>(null);
 	const [selectedBot, setSelectedBot] = useState<SelectedBotSnapshot | null>(null);
+	const [generationIoStatus, setGenerationIoStatus] = useState<string>("");
+	const generationLoadInputRef = useRef<HTMLInputElement | null>(null);
 	const prevAiExchangeRef = useRef<AiExchange | null>(null);
 	const [ui, setUi] = useState<UiSnapshot>(() => ({
 		health: 100,
@@ -1881,6 +2027,42 @@ export default function CityEscapeGeneticSim3D() {
 			prevAiExchangeRef.current = prev[0] ?? null;
 			return [exchange];
 		});
+	};
+
+	const exportGeneration = () => {
+		window.dispatchEvent(
+			new CustomEvent("sim6-export-generation", {
+				detail: {
+					onData: (payload: SerializedGeneration) => {
+						const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+						const url = URL.createObjectURL(blob);
+						const a = document.createElement("a");
+						a.href = url;
+						a.download = `sim6-generation-g${payload.generation}.json`;
+						a.click();
+						URL.revokeObjectURL(url);
+						setGenerationIoStatus(`Exported generation ${payload.generation}`);
+					},
+				},
+			}),
+		);
+	};
+
+	const onLoadGenerationFile = (ev: React.ChangeEvent<HTMLInputElement>) => {
+		const file = ev.target.files?.[0];
+		if (!file) return;
+		const reader = new FileReader();
+		reader.onload = () => {
+			try {
+				const payload = JSON.parse(String(reader.result ?? "{}")) as SerializedGeneration;
+				window.dispatchEvent(new CustomEvent("sim6-load-generation", { detail: { payload } }));
+				setGenerationIoStatus(`Loaded generation ${payload.generation || 1}`);
+			} catch {
+				setGenerationIoStatus("Failed to load generation file");
+			}
+		};
+		reader.readAsText(file);
+		ev.target.value = "";
 	};
 
 	return (
@@ -1970,6 +2152,8 @@ export default function CityEscapeGeneticSim3D() {
 										<tr><th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal">Energy</th><td className="py-[2px] text-slate-100 font-mono">{selectedBot.energy.toFixed(1)}</td></tr>
 										<tr><th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal">Kills</th><td className="py-[2px] text-slate-100 font-mono">{selectedBot.enemyKills}</td></tr>
 										<tr><th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal">Direction Changes</th><td className="py-[2px] text-slate-100 font-mono">{selectedBot.directionChanges}</td></tr>
+										<tr><th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal">Facing (x,z)</th><td className="py-[2px] text-slate-100 font-mono">{selectedBot.heading.x.toFixed(2)}, {selectedBot.heading.z.toFixed(2)}</td></tr>
+										<tr><th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal">Facing Yaw</th><td className="py-[2px] text-slate-100 font-mono">{selectedBot.heading.yawDeg.toFixed(1)} deg</td></tr>
 										<tr><th className="w-[42%] pr-2 py-[2px] text-slate-400 font-normal">Position</th><td className="py-[2px] text-slate-100 font-mono">{selectedBot.position.x.toFixed(1)}, {selectedBot.position.z.toFixed(1)}</td></tr>
 									</tbody>
 								</table>
@@ -1999,6 +2183,22 @@ export default function CityEscapeGeneticSim3D() {
 
 					{!controlsCollapsed && (
 						<CardContent className="space-y-4">
+							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-2">
+								<div className="font-semibold">Generation Controls</div>
+								<div className="grid grid-cols-2 gap-2">
+									<Button variant="secondary" onClick={exportGeneration}>Export Generation</Button>
+									<Button variant="secondary" onClick={() => generationLoadInputRef.current?.click()}>Load Generation</Button>
+								</div>
+								<input
+									ref={generationLoadInputRef}
+									type="file"
+									accept="application/json"
+									onChange={onLoadGenerationFile}
+									style={{ display: "none" }}
+								/>
+								{generationIoStatus ? <div className="text-xs text-slate-300">{generationIoStatus}</div> : null}
+							</div>
+
 							<div className="rounded-xl border border-slate-700 p-3 text-sm space-y-1">
 								<div>Status: <strong>{ui.status}</strong></div>
 								<div>Enemies alive: <strong>{ui.enemiesAlive}</strong></div>
@@ -2107,6 +2307,11 @@ export default function CityEscapeGeneticSim3D() {
 								<div>
 									<div className="flex justify-between text-sm mb-1"><span>AI tick (Hz)</span><span>{settings.aiHz.toFixed(1)}</span></div>
 									<Slider value={[settings.aiHz]} min={0.5} max={8} step={0.5} onValueChange={(v: number[]) => setSettings((p) => ({ ...p, aiHz: v[0] }))} />
+								</div>
+
+								<div>
+									<div className="flex justify-between text-sm mb-1"><span>Generation duration (s)</span><span>{settings.generationSeconds.toFixed(0)}</span></div>
+									<Slider value={[settings.generationSeconds]} min={5} max={120} step={1} onValueChange={(v: number[]) => setSettings((p) => ({ ...p, generationSeconds: v[0] }))} />
 								</div>
 
 								<div>
