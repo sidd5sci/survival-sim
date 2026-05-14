@@ -28,14 +28,14 @@ class RootMotionController:
 
     def __init__(
         self,
-        walk_speed: float = 0.95,
-        run_speed: float = 1.85,
+        walk_speed: float = 1.15,
+        run_speed: float = 2.20,
         inertia: float = 1.45,
-        friction: float = 2.20,
-        accel_gain: float = 6.8,
-        turn_inertia: float = 2.8,
-        turn_damping: float = 3.4,
-        dir_smoothing: float = 7.5,
+        friction: float = 2.00,
+        accel_gain: float = 8.0,
+        turn_inertia: float = 2.2,
+        turn_damping: float = 2.9,
+        dir_smoothing: float = 8.8,
     ) -> None:
         self.walk_speed = float(max(0.05, walk_speed))
         self.run_speed = float(max(self.walk_speed, run_speed))

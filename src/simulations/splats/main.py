@@ -172,19 +172,19 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--joint-damping",
         type=float,
-        default=6.8,
+        default=6.0,
         help="Joint angular damping for velocity interpolation",
     )
     parser.add_argument(
         "--joint-stiffness",
         type=float,
-        default=16.0,
+        default=17.5,
         help="Joint stiffness driving velocity toward target rotations",
     )
     parser.add_argument(
         "--joint-max-velocity",
         type=float,
-        default=8.0,
+        default=10.5,
         help="Maximum angular velocity per joint (rad/s)",
     )
     parser.add_argument(
@@ -213,7 +213,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--root-friction",
         type=float,
-        default=2.2,
+        default=2.0,
         help="Root movement friction damping",
     )
     parser.add_argument(
@@ -228,10 +228,11 @@ def _parse_args() -> argparse.Namespace:
 def main() -> None:
     args = _parse_args()
 
-    renderer = GaussianSplatRenderer(width=1280, height=720, max_particles=100000, max_bones=128)
+    body_particle_count = 700_000
+    renderer = GaussianSplatRenderer(width=1280, height=720, max_particles=body_particle_count + max(500, args.face_particles), max_bones=128)
     camera = Camera(target=np.array([0.0, 1.0, 0.0], dtype=np.float32))
 
-    particle_data = generate_human_particles(total_particles=14000, seed=5)
+    particle_data = generate_human_particles(total_particles=body_particle_count, seed=5)
     if args.face_image:
         particle_data = attach_face_splats(
             base=particle_data,
@@ -254,16 +255,16 @@ def main() -> None:
         critical_damping=args.joint_critical_damping,
         damping_ratio=args.joint_damping_ratio,
     )
-    secondary_motion = SecondaryMotionController(response=8.5)
+    secondary_motion = SecondaryMotionController(response=7.2)
     root_motion = RootMotionController(
-        walk_speed=0.95,
-        run_speed=1.85,
+        walk_speed=1.15,
+        run_speed=2.20,
         inertia=args.root_inertia,
         friction=args.root_friction,
-        accel_gain=6.8,
-        turn_inertia=2.8,
-        turn_damping=3.4,
-        dir_smoothing=7.5,
+        accel_gain=8.0,
+        turn_inertia=2.2,
+        turn_damping=2.9,
+        dir_smoothing=8.8,
     )
     motion_physics = MotionPhysicsController(
         joint_dynamics=joint_dynamics,

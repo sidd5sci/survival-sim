@@ -53,10 +53,10 @@ class JointDynamics:
     def __init__(
         self,
         joint_count: int,
-        damping: float = 6.8,
-        stiffness: float = 16.0,
+        damping: float = 6.0,
+        stiffness: float = 17.5,
         inertia: float = 1.0,
-        max_velocity: float = 8.0,
+        max_velocity: float = 10.5,
         max_acceleration: float = 120.0,
         velocity_smoothing: float = 0.35,
         critical_damping: bool = False,
@@ -105,18 +105,18 @@ class JointDynamics:
     def _configure_spring_profiles(self) -> None:
         # Default profile already set from constructor; now tune key regions.
         # Spine and chest: soft follow-through with settle.
-        self._set_joint_profile("spine", stiffness=13.0, damping=4.2, inertia=1.6)
-        self._set_joint_profile("chest", stiffness=12.2, damping=3.9, inertia=1.7)
+        self._set_joint_profile("spine", stiffness=14.2, damping=3.6, inertia=1.75)
+        self._set_joint_profile("chest", stiffness=13.5, damping=3.3, inertia=1.85)
 
         # Neck/head: stabilize but still permit subtle lag.
-        self._set_joint_profile("neck", stiffness=14.0, damping=5.8, inertia=1.0)
-        self._set_joint_profile("head", stiffness=14.8, damping=6.0, inertia=0.95)
+        self._set_joint_profile("neck", stiffness=13.6, damping=5.0, inertia=1.1)
+        self._set_joint_profile("head", stiffness=14.2, damping=5.2, inertia=1.05)
 
         # Shoulders and arms: more inertia and lower damping for overshoot/settle.
         for side in ("l", "r"):
-            self._set_joint_profile(f"shoulder_{side}", stiffness=10.0, damping=3.2, inertia=2.1)
-            self._set_joint_profile(f"elbow_{side}", stiffness=11.6, damping=3.6, inertia=1.8)
-            self._set_joint_profile(f"hand_{side}", stiffness=12.8, damping=4.1, inertia=1.45)
+            self._set_joint_profile(f"shoulder_{side}", stiffness=11.5, damping=2.7, inertia=2.25)
+            self._set_joint_profile(f"elbow_{side}", stiffness=12.5, damping=3.1, inertia=1.95)
+            self._set_joint_profile(f"hand_{side}", stiffness=13.2, damping=3.6, inertia=1.6)
 
     def set_config(
         self,

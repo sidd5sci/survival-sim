@@ -34,3 +34,5 @@ coverage
 *.njsproj
 *.sln
 *.sw?
+src/simulations/splats/__pycache__/
+*.zip

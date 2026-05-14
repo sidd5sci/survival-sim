@@ -219,6 +219,10 @@ def _sample_limb(
     return coords
 
 
+def _offset_local(local_pts: np.ndarray, offset_xyz: tuple[float, float, float]) -> np.ndarray:
+    return (local_pts + np.asarray(offset_xyz, dtype=np.float32)[None, :]).astype(np.float32)
+
+
 def _append_part(
     positions: list[np.ndarray],
     colors: list[np.ndarray],
@@ -268,13 +272,13 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
     joints: list[np.ndarray] = []
 
     # Soft allocation ratios by body part.
-    n_head = int(total_particles * 0.10)
-    n_torso = int(total_particles * 0.28)
+    n_head = int(total_particles * 0.09)
+    n_torso = int(total_particles * 0.31)
     n_arms = int(total_particles * 0.25)
-    n_legs = int(total_particles * 0.30)
+    n_legs = int(total_particles * 0.29)
     n_extras = total_particles - (n_head + n_torso + n_arms + n_legs)
 
-    # Head and neck
+    # Head
     _append_part(
         positions,
         colors,
@@ -289,10 +293,11 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
         rng=rng,
     )
 
-    # Torso chunks distributed across pelvis/spine/chest for better bend behavior.
-    pelvis_n = int(n_torso * 0.30)
-    spine_n = int(n_torso * 0.30)
-    chest_n = n_torso - pelvis_n - spine_n
+    # Torso chunks distributed across pelvis/spine/chest/neck for better silhouette.
+    pelvis_n = int(n_torso * 0.31)
+    spine_n = int(n_torso * 0.24)
+    chest_n = int(n_torso * 0.35)
+    neck_n = n_torso - pelvis_n - spine_n - chest_n
 
     _append_part(
         positions,
@@ -300,7 +305,7 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
         sizes,
         brightness,
         joints,
-        _sample_ellipsoid(rng, pelvis_n, (0.17, 0.11, 0.10)),
+        _sample_ellipsoid(rng, pelvis_n, (0.21, 0.12, 0.13)),
         color_rgb=(0.26, 0.58, 0.84),
         size_range=(5.0, 8.2),
         brightness_range=(0.76, 1.00),
@@ -314,7 +319,7 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
         sizes,
         brightness,
         joints,
-        _sample_ellipsoid(rng, spine_n, (0.16, 0.16, 0.10)),
+        _sample_ellipsoid(rng, spine_n, (0.12, 0.17, 0.08)),
         color_rgb=(0.22, 0.54, 0.80),
         size_range=(4.8, 8.0),
         brightness_range=(0.74, 0.98),
@@ -328,7 +333,7 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
         sizes,
         brightness,
         joints,
-        _sample_ellipsoid(rng, chest_n, (0.19, 0.17, 0.11)),
+        _sample_ellipsoid(rng, chest_n, (0.24, 0.18, 0.13)),
         color_rgb=(0.20, 0.50, 0.75),
         size_range=(5.0, 8.8),
         brightness_range=(0.78, 1.03),
@@ -336,16 +341,31 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
         rng=rng,
     )
 
+    _append_part(
+        positions,
+        colors,
+        sizes,
+        brightness,
+        joints,
+        _sample_ellipsoid(rng, neck_n, (0.07, 0.10, 0.07)),
+        color_rgb=(0.78, 0.66, 0.58),
+        size_range=(3.8, 6.0),
+        brightness_range=(0.82, 1.06),
+        joint_name="neck",
+        rng=rng,
+    )
+
     # Arms
     arm_each = n_arms // 4
     for side in ("l", "r"):
+        side_sign = -1.0 if side == "l" else 1.0
         _append_part(
             positions,
             colors,
             sizes,
             brightness,
             joints,
-            _sample_limb(rng, arm_each, length=0.33, radius=0.06),
+            _offset_local(_sample_limb(rng, arm_each, length=0.34, radius=0.055), (0.02 * side_sign, -0.01, 0.01)),
             color_rgb=(0.80, 0.66, 0.58),
             size_range=(3.6, 6.5),
             brightness_range=(0.72, 0.98),
@@ -358,7 +378,7 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
             sizes,
             brightness,
             joints,
-            _sample_limb(rng, arm_each, length=0.30, radius=0.05),
+            _offset_local(_sample_limb(rng, arm_each, length=0.31, radius=0.046), (0.02 * side_sign, 0.0, 0.01)),
             color_rgb=(0.84, 0.69, 0.60),
             size_range=(3.2, 6.0),
             brightness_range=(0.72, 1.02),
@@ -369,13 +389,14 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
     # Legs
     leg_each = n_legs // 4
     for side in ("l", "r"):
+        side_sign = -1.0 if side == "l" else 1.0
         _append_part(
             positions,
             colors,
             sizes,
             brightness,
             joints,
-            _sample_limb(rng, leg_each, length=0.44, radius=0.08),
+            _offset_local(_sample_limb(rng, leg_each, length=0.45, radius=0.072), (0.018 * side_sign, 0.0, 0.0)),
             color_rgb=(0.30, 0.32, 0.36),
             size_range=(4.0, 7.0),
             brightness_range=(0.65, 0.90),
@@ -388,7 +409,7 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
             sizes,
             brightness,
             joints,
-            _sample_limb(rng, leg_each, length=0.43, radius=0.07),
+            _offset_local(_sample_limb(rng, leg_each, length=0.44, radius=0.064), (0.016 * side_sign, 0.0, 0.0)),
             color_rgb=(0.26, 0.28, 0.32),
             size_range=(3.8, 6.8),
             brightness_range=(0.62, 0.88),
@@ -397,8 +418,9 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
         )
 
         foot_n = max(100, n_extras // 4)
-        foot_pts = _sample_ellipsoid(rng, foot_n, (0.10, 0.05, 0.16))
-        foot_pts[:, 2] += 0.07
+        foot_pts = _sample_ellipsoid(rng, foot_n, (0.082, 0.042, 0.21))
+        foot_pts[:, 2] += 0.10
+        foot_pts[:, 0] += 0.014 * side_sign
         _append_part(
             positions,
             colors,

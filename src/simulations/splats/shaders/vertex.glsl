@@ -41,7 +41,7 @@ void main() {
     float dist = max(0.001, -view_pos.z);
 
     gl_Position = u_mvp * vec4(world_pos, 1.0);
-    gl_PointSize = clamp((in_size * u_point_scale) / dist, 1.5, 36.0);
+    gl_PointSize = clamp((in_size * 0.86 * u_point_scale) / dist, 1.2, 30.0);
 
     v_color = in_color;
     v_brightness = in_brightness;

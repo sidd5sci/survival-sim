@@ -181,26 +181,42 @@ class MotionAIController:
 
         if prompt == "idle":
             breath = np.sin(2.0 * np.pi * 0.28 * t)
-            euler[JOINT_INDEX["spine"], 0] = 0.03 * breath * intensity
-            euler[JOINT_INDEX["chest"], 0] = 0.05 * breath * intensity
-            euler[JOINT_INDEX["head"], 0] = 0.04 * breath * intensity
-            root[1] = 0.010 * breath
+            sway = np.sin(2.0 * np.pi * 0.19 * t + 0.55)
+            # Idle stance bias: slight knee bend, open shoulders, and soft S-curve.
+            euler[JOINT_INDEX["pelvis"], 2] = -0.03
+            euler[JOINT_INDEX["spine"], 0] = 0.06 * breath * intensity
+            euler[JOINT_INDEX["chest"], 0] = 0.10 * breath * intensity
+            euler[JOINT_INDEX["head"], 0] = 0.07 * breath * intensity
+            euler[JOINT_INDEX["chest"], 2] = 0.045 * sway * intensity
+            euler[JOINT_INDEX["spine"], 2] = -0.030 + 0.020 * sway * intensity
+            euler[JOINT_INDEX["shoulder_l"], 0] = -0.12
+            euler[JOINT_INDEX["shoulder_r"], 0] = -0.12
+            euler[JOINT_INDEX["shoulder_l"], 2] = 0.18
+            euler[JOINT_INDEX["shoulder_r"], 2] = -0.18
+            euler[JOINT_INDEX["elbow_l"], 0] = 0.18
+            euler[JOINT_INDEX["elbow_r"], 0] = 0.18
+            euler[JOINT_INDEX["knee_l"], 0] = 0.18
+            euler[JOINT_INDEX["knee_r"], 0] = 0.18
+            euler[JOINT_INDEX["foot_l"], 0] = -0.08
+            euler[JOINT_INDEX["foot_r"], 0] = -0.08
+            root[1] = 0.020 * breath
+            root[0] = 0.010 * sway
             return euler, root
 
         if prompt == "walk":
             w = 2.0 * np.pi * (1.25 + 0.35 * intensity)
             s = np.sin(w * t)
             s2 = np.sin(2.0 * w * t + 0.4)
-            euler[JOINT_INDEX["shoulder_l"], 0] = 0.60 * s * intensity
-            euler[JOINT_INDEX["shoulder_r"], 0] = -0.60 * s * intensity
-            euler[JOINT_INDEX["hip_l"], 0] = -0.72 * s * intensity
-            euler[JOINT_INDEX["hip_r"], 0] = 0.72 * s * intensity
-            euler[JOINT_INDEX["knee_l"], 0] = 0.20 + 0.82 * max(0.0, s) * intensity
-            euler[JOINT_INDEX["knee_r"], 0] = 0.20 + 0.82 * max(0.0, -s) * intensity
-            euler[JOINT_INDEX["chest"], 2] = -0.04 * s
-            euler[JOINT_INDEX["spine"], 2] = 0.04 * s
-            root[1] = 0.016 * s2
-            root[2] = 0.060 * np.sin(w * t + np.pi / 2.0) * intensity
+            euler[JOINT_INDEX["shoulder_l"], 0] = 0.95 * s * intensity
+            euler[JOINT_INDEX["shoulder_r"], 0] = -0.95 * s * intensity
+            euler[JOINT_INDEX["hip_l"], 0] = -1.02 * s * intensity
+            euler[JOINT_INDEX["hip_r"], 0] = 1.02 * s * intensity
+            euler[JOINT_INDEX["knee_l"], 0] = 0.28 + 1.15 * max(0.0, s) * intensity
+            euler[JOINT_INDEX["knee_r"], 0] = 0.28 + 1.15 * max(0.0, -s) * intensity
+            euler[JOINT_INDEX["chest"], 2] = -0.10 * s
+            euler[JOINT_INDEX["spine"], 2] = 0.09 * s
+            root[1] = 0.032 * s2
+            root[2] = 0.100 * np.sin(w * t + np.pi / 2.0) * intensity
             return euler, root
 
         if prompt == "wave":
@@ -221,17 +237,17 @@ class MotionAIController:
             w = 2.0 * np.pi * (1.6 + 0.9 * intensity)
             s = np.sin(w * t)
             c = np.cos(w * t)
-            euler[JOINT_INDEX["pelvis"], 1] = 0.28 * s
-            euler[JOINT_INDEX["chest"], 2] = 0.24 * c
-            euler[JOINT_INDEX["head"], 1] = 0.22 * s
-            euler[JOINT_INDEX["shoulder_l"], 0] = 0.72 * s
-            euler[JOINT_INDEX["shoulder_r"], 0] = -0.72 * s
-            euler[JOINT_INDEX["hip_l"], 0] = -0.52 * c
-            euler[JOINT_INDEX["hip_r"], 0] = 0.52 * c
-            euler[JOINT_INDEX["knee_l"], 0] = 0.26 + 0.45 * max(0.0, s)
-            euler[JOINT_INDEX["knee_r"], 0] = 0.26 + 0.45 * max(0.0, -s)
-            root[1] = 0.034 * np.sin(2.0 * w * t)
-            root[2] = 0.030 * np.sin(w * t + 0.4)
+            euler[JOINT_INDEX["pelvis"], 1] = 0.42 * s
+            euler[JOINT_INDEX["chest"], 2] = 0.34 * c
+            euler[JOINT_INDEX["head"], 1] = 0.30 * s
+            euler[JOINT_INDEX["shoulder_l"], 0] = 1.00 * s
+            euler[JOINT_INDEX["shoulder_r"], 0] = -1.00 * s
+            euler[JOINT_INDEX["hip_l"], 0] = -0.68 * c
+            euler[JOINT_INDEX["hip_r"], 0] = 0.68 * c
+            euler[JOINT_INDEX["knee_l"], 0] = 0.30 + 0.65 * max(0.0, s)
+            euler[JOINT_INDEX["knee_r"], 0] = 0.30 + 0.65 * max(0.0, -s)
+            root[1] = 0.050 * np.sin(2.0 * w * t)
+            root[2] = 0.048 * np.sin(w * t + 0.4)
             return euler, root
 
         # point
@@ -250,7 +266,7 @@ class MotionAIController:
 
         # Latent channels modulate specific regions to add non-repeating micro-variation.
         l = latent
-        amp = 0.20 * intensity
+        amp = 0.30 * intensity
         euler[JOINT_INDEX["spine"], 2] += amp * l[0] * 0.18
         euler[JOINT_INDEX["chest"], 1] += amp * l[1] * 0.22
         euler[JOINT_INDEX["head"], 0] += amp * l[2] * 0.18
@@ -263,10 +279,10 @@ class MotionAIController:
         euler[JOINT_INDEX["knee_l"], 0] += amp * l[9] * 0.22
         euler[JOINT_INDEX["knee_r"], 0] += amp * l[10] * 0.22
 
-        root += np.array([0.0, 0.010 * l[11], 0.012 * l[12] * intensity], dtype=np.float32)
+        root += np.array([0.0, 0.016 * l[11], 0.020 * l[12] * intensity], dtype=np.float32)
 
         # Movement smoothing in latent-decoded pose space.
-        smooth = 0.22
+        smooth = 0.24
         euler = ((1.0 - smooth) * self.prev_euler + smooth * euler).astype(np.float32)
         root = ((1.0 - smooth) * self.prev_root + smooth * root).astype(np.float32)
         self.prev_euler = euler
@@ -343,9 +359,9 @@ class MotionAIController:
 
         locomotion = np.zeros((3,), dtype=np.float32)
         if self.current_prompt == "walk":
-            locomotion[2] = -0.65 * self.current_intensity * dt
+            locomotion[2] = -0.88 * self.current_intensity * dt
         elif self.current_prompt == "dance":
-            locomotion[2] = -0.15 * self.current_intensity * dt
+            locomotion[2] = -0.24 * self.current_intensity * dt
 
         return MotionAISample(
             prompt=self.current_prompt,

@@ -168,8 +168,8 @@ class BalanceSystemController:
         # Movement lean + turning balance.
         lean_target = np.array(
             [
-                -0.05 * forward_accel - 0.020 * forward_vel,
-                -0.05 * lateral_accel - 0.018 * lateral_vel - 0.03 * turn_speed,
+                -0.09 * forward_accel - 0.040 * forward_vel,
+                -0.10 * lateral_accel - 0.034 * lateral_vel - 0.055 * turn_speed,
             ],
             dtype=np.float32,
         )
@@ -177,48 +177,48 @@ class BalanceSystemController:
         # Pelvis compensation keeps COM over support center.
         pelvis_target = np.array(
             [
-                -0.22 * error[0] + 0.04 * lateral_vel,
+                -0.32 * error[0] + 0.08 * lateral_vel,
                 0.0,
-                -0.25 * error[2] + 0.05 * forward_vel,
+                -0.36 * error[2] + 0.10 * forward_vel,
             ],
             dtype=np.float32,
         )
 
         # Balance recovery boost when COM drifts too far.
         if err_mag > 0.09:
-            recover = min(0.20, (err_mag - 0.09) * 0.55)
+            recover = min(0.28, (err_mag - 0.09) * 0.82)
             pelvis_target[0] += -recover * np.sign(error[0])
             pelvis_target[2] += -recover * np.sign(error[2])
 
         # Idle sway when almost stationary.
         idle_sway = np.zeros((2,), dtype=np.float32)
         if root_speed < 0.12:
-            idle_sway[0] = 0.010 * np.sin(2.0 * np.pi * 0.45 * self.time)
-            idle_sway[1] = 0.013 * np.sin(2.0 * np.pi * 0.31 * self.time + 0.7)
+            idle_sway[0] = 0.018 * np.sin(2.0 * np.pi * 0.45 * self.time)
+            idle_sway[1] = 0.024 * np.sin(2.0 * np.pi * 0.31 * self.time + 0.7)
 
         torso_target = np.array(
             [
-                0.34 * (lean_target[0] + idle_sway[0]),
-                0.34 * (lean_target[1] + idle_sway[1]),
+                0.52 * (lean_target[0] + idle_sway[0]),
+                0.58 * (lean_target[1] + idle_sway[1]),
             ],
             dtype=np.float32,
         )
 
         upper_target = np.array(
             [
-                -0.58 * torso_target[0],
-                -0.62 * torso_target[1],
+                -0.72 * torso_target[0],
+                -0.78 * torso_target[1],
             ],
             dtype=np.float32,
         )
 
-        self.pelvis_comp = self._smooth(self.pelvis_comp, pelvis_target, rate=6.5, dt=dts)
-        self.torso_corr = self._smooth(self.torso_corr, torso_target, rate=7.2, dt=dts)
-        self.upper_stab = self._smooth(self.upper_stab, upper_target, rate=8.5, dt=dts)
+        self.pelvis_comp = self._smooth(self.pelvis_comp, pelvis_target, rate=7.2, dt=dts)
+        self.torso_corr = self._smooth(self.torso_corr, torso_target, rate=7.6, dt=dts)
+        self.upper_stab = self._smooth(self.upper_stab, upper_target, rate=8.9, dt=dts)
 
-        self.pelvis_comp = np.clip(self.pelvis_comp, -0.12, 0.12)
-        self.torso_corr = np.clip(self.torso_corr, -0.24, 0.24)
-        self.upper_stab = np.clip(self.upper_stab, -0.22, 0.22)
+        self.pelvis_comp = np.clip(self.pelvis_comp, -0.18, 0.18)
+        self.torso_corr = np.clip(self.torso_corr, -0.36, 0.36)
+        self.upper_stab = np.clip(self.upper_stab, -0.32, 0.32)
 
         gain = self.strength
 
@@ -232,8 +232,8 @@ class BalanceSystemController:
         head = JOINT_INDEX["head"]
 
         # Torso correction and balance lean.
-        out.local_rotations[spine] = _rot_x(gain * self.torso_corr[0] * 0.60) @ _rot_z(gain * self.torso_corr[1] * 0.50) @ out.local_rotations[spine]
-        out.local_rotations[chest] = _rot_x(gain * self.torso_corr[0]) @ _rot_z(gain * self.torso_corr[1]) @ _rot_y(gain * 0.06 * turn_speed) @ out.local_rotations[chest]
+        out.local_rotations[spine] = _rot_x(gain * self.torso_corr[0] * 0.72) @ _rot_z(gain * self.torso_corr[1] * 0.62) @ out.local_rotations[spine]
+        out.local_rotations[chest] = _rot_x(gain * self.torso_corr[0]) @ _rot_z(gain * self.torso_corr[1]) @ _rot_y(gain * 0.10 * turn_speed) @ out.local_rotations[chest]
 
         # Upper body stabilization counters torso motion for believable balance.
         out.local_rotations[neck] = _rot_x(gain * self.upper_stab[0] * 0.75) @ _rot_y(gain * self.upper_stab[1] * 0.85) @ out.local_rotations[neck]

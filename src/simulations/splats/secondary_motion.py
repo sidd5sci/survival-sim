@@ -127,8 +127,8 @@ class SecondaryMotionController:
         # Shoulder lag: delayed counter-rotation to sudden movement and turning.
         shoulder_target = np.array(
             [
-                -0.11 * lateral_accel - 0.03 * turn,
-                -0.08 * turn - 0.03 * lateral_vel,
+                -0.18 * lateral_accel - 0.05 * turn,
+                -0.12 * turn - 0.04 * lateral_vel,
             ],
             dtype=np.float32,
         )
@@ -137,8 +137,8 @@ class SecondaryMotionController:
         # Spine drag: torso trails momentum and catches up naturally.
         spine_target = np.array(
             [
-                -0.07 * forward_accel - 0.03 * forward_vel,
-                -0.10 * lateral_accel - 0.04 * turn,
+                -0.12 * forward_accel - 0.06 * forward_vel,
+                -0.16 * lateral_accel - 0.07 * turn,
             ],
             dtype=np.float32,
         )
@@ -147,8 +147,8 @@ class SecondaryMotionController:
         # Head stabilization: counter chest/body perturbations.
         head_target = np.array(
             [
-                0.05 * forward_accel + 0.02 * speed,
-                0.06 * turn + 0.02 * lateral_accel,
+                0.10 * forward_accel + 0.03 * speed,
+                0.10 * turn + 0.03 * lateral_accel,
             ],
             dtype=np.float32,
         )
@@ -157,20 +157,20 @@ class SecondaryMotionController:
         # Arm follow-through: delayed swing with overshoot tendency during turns/speed changes.
         arm_target = np.array(
             [
-                -0.18 * forward_accel - 0.10 * turn,
-                0.10 * lateral_accel,
-                -0.18 * forward_accel + 0.10 * turn,
-                0.10 * lateral_accel,
+                -0.28 * forward_accel - 0.16 * turn,
+                0.16 * lateral_accel,
+                -0.28 * forward_accel + 0.16 * turn,
+                0.16 * lateral_accel,
             ],
             dtype=np.float32,
         )
         self.arm_follow = self._approach_vec(self.arm_follow, arm_target, rate=self.response * 0.55, dt=dts)
 
         # Clamp amplitudes to keep secondary motion stable and believable.
-        self.shoulder_lag = np.clip(self.shoulder_lag, -0.32, 0.32)
-        self.spine_drag = np.clip(self.spine_drag, -0.26, 0.26)
-        self.head_stabilize = np.clip(self.head_stabilize, -0.22, 0.22)
-        self.arm_follow = np.clip(self.arm_follow, -0.45, 0.45)
+        self.shoulder_lag = np.clip(self.shoulder_lag, -0.48, 0.48)
+        self.spine_drag = np.clip(self.spine_drag, -0.38, 0.38)
+        self.head_stabilize = np.clip(self.head_stabilize, -0.30, 0.30)
+        self.arm_follow = np.clip(self.arm_follow, -0.66, 0.66)
 
         spine = JOINT_INDEX["spine"]
         chest = JOINT_INDEX["chest"]
@@ -182,18 +182,18 @@ class SecondaryMotionController:
         elbow_r = JOINT_INDEX["elbow_r"]
 
         # Apply spine drag across spine/chest for upper-body softness.
-        out.local_rotations[spine] = _rot_x(self.spine_drag[0] * 0.7) @ _rot_z(self.spine_drag[1] * 0.6) @ out.local_rotations[spine]
+        out.local_rotations[spine] = _rot_x(self.spine_drag[0] * 0.9) @ _rot_z(self.spine_drag[1] * 0.75) @ out.local_rotations[spine]
         out.local_rotations[chest] = _rot_x(self.spine_drag[0]) @ _rot_z(self.spine_drag[1]) @ out.local_rotations[chest]
 
         # Shoulder lag and arm follow-through.
         out.local_rotations[shoulder_l] = _rot_x(self.shoulder_lag[0] + self.arm_follow[0]) @ _rot_y(self.shoulder_lag[1]) @ out.local_rotations[shoulder_l]
         out.local_rotations[shoulder_r] = _rot_x(self.shoulder_lag[0] + self.arm_follow[2]) @ _rot_y(-self.shoulder_lag[1]) @ out.local_rotations[shoulder_r]
 
-        out.local_rotations[elbow_l] = _rot_x(self.arm_follow[0] * 0.45) @ _rot_z(self.arm_follow[1] * 0.40) @ out.local_rotations[elbow_l]
-        out.local_rotations[elbow_r] = _rot_x(self.arm_follow[2] * 0.45) @ _rot_z(-self.arm_follow[3] * 0.40) @ out.local_rotations[elbow_r]
+        out.local_rotations[elbow_l] = _rot_x(self.arm_follow[0] * 0.58) @ _rot_z(self.arm_follow[1] * 0.52) @ out.local_rotations[elbow_l]
+        out.local_rotations[elbow_r] = _rot_x(self.arm_follow[2] * 0.58) @ _rot_z(-self.arm_follow[3] * 0.52) @ out.local_rotations[elbow_r]
 
         # Head stabilization uses neck + head counter offsets.
-        out.local_rotations[neck] = _rot_x(-self.head_stabilize[0] * 0.7) @ _rot_y(-self.head_stabilize[1] * 0.8) @ out.local_rotations[neck]
+        out.local_rotations[neck] = _rot_x(-self.head_stabilize[0] * 0.85) @ _rot_y(-self.head_stabilize[1] * 0.95) @ out.local_rotations[neck]
         out.local_rotations[head] = _rot_x(-self.head_stabilize[0]) @ _rot_y(-self.head_stabilize[1]) @ out.local_rotations[head]
 
         return out

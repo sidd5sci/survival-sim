@@ -129,6 +129,7 @@ class GaussianSplatRenderer:
 
         self.ctx = moderngl.create_context(require=330)
         self.ctx.enable(moderngl.BLEND)
+        self.ctx.enable(moderngl.DEPTH_TEST)
         self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
         self.ctx.blend_func = moderngl.SRC_ALPHA, moderngl.ONE_MINUS_SRC_ALPHA
 
