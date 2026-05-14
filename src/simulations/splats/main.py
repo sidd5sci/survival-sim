@@ -7,11 +7,17 @@ import numpy as np
 import pygame
 
 from animation import JOINT_INDEX, JOINT_NAMES, PARENTS, SkeletalAnimator
+from balance_system import BalanceSystemController
 from deformation_ai import NeuralDeformationController
+from foot_planting import FootPlantingController
 from human_generator import attach_face_splats, generate_human_particles
 from ik_solver import solve_limb_ik
+from joint_dynamics import JointDynamics
+from motion_physics_controller import MotionPhysicsController
 from motion_ai import MotionAIController, PROMPT_TOKENS
 from renderer import Camera, GaussianSplatRenderer, look_at, perspective
+from root_motion import RootMotionController
+from secondary_motion import SecondaryMotionController
 from skinning import (
     apply_skinning,
     apply_skinning_matrix_palette,
@@ -163,6 +169,59 @@ def _parse_args() -> argparse.Namespace:
         default=30.0,
         help="Neural deformation inference rate in Hz",
     )
+    parser.add_argument(
+        "--joint-damping",
+        type=float,
+        default=6.8,
+        help="Joint angular damping for velocity interpolation",
+    )
+    parser.add_argument(
+        "--joint-stiffness",
+        type=float,
+        default=16.0,
+        help="Joint stiffness driving velocity toward target rotations",
+    )
+    parser.add_argument(
+        "--joint-max-velocity",
+        type=float,
+        default=8.0,
+        help="Maximum angular velocity per joint (rad/s)",
+    )
+    parser.add_argument(
+        "--joint-inertia",
+        type=float,
+        default=1.0,
+        help="Joint inertia for spring-damper dynamics",
+    )
+    parser.add_argument(
+        "--joint-critical-damping",
+        action="store_true",
+        help="Enable critically damped spring behavior",
+    )
+    parser.add_argument(
+        "--joint-damping-ratio",
+        type=float,
+        default=1.0,
+        help="Damping ratio used when --joint-critical-damping is enabled",
+    )
+    parser.add_argument(
+        "--root-inertia",
+        type=float,
+        default=1.45,
+        help="Root movement inertia (higher feels heavier)",
+    )
+    parser.add_argument(
+        "--root-friction",
+        type=float,
+        default=2.2,
+        help="Root movement friction damping",
+    )
+    parser.add_argument(
+        "--balance-strength",
+        type=float,
+        default=1.0,
+        help="Balance compensation strength (0 disables)",
+    )
     return parser.parse_args()
 
 
@@ -184,6 +243,35 @@ def main() -> None:
     animator = SkeletalAnimator(walk_frequency_hz=1.55)
     motion_ai = MotionAIController(fps=60.0, seed=19, sequence_len=84)
     motion_ai.enqueue_prompt(args.motion_prompt)
+    joint_dynamics = JointDynamics(
+        joint_count=len(JOINT_NAMES),
+        damping=args.joint_damping,
+        stiffness=args.joint_stiffness,
+        inertia=args.joint_inertia,
+        max_velocity=args.joint_max_velocity,
+        max_acceleration=120.0,
+        velocity_smoothing=0.35,
+        critical_damping=args.joint_critical_damping,
+        damping_ratio=args.joint_damping_ratio,
+    )
+    secondary_motion = SecondaryMotionController(response=8.5)
+    root_motion = RootMotionController(
+        walk_speed=0.95,
+        run_speed=1.85,
+        inertia=args.root_inertia,
+        friction=args.root_friction,
+        accel_gain=6.8,
+        turn_inertia=2.8,
+        turn_damping=3.4,
+        dir_smoothing=7.5,
+    )
+    motion_physics = MotionPhysicsController(
+        joint_dynamics=joint_dynamics,
+        secondary_motion=secondary_motion,
+        root_motion=root_motion,
+        foot_planting=FootPlantingController(),
+        balance_system=BalanceSystemController(strength=args.balance_strength),
+    )
     deformer = NeuralDeformationController(
         local_positions=particle_data.local_positions,
         bind_world_positions=particle_data.bind_world_positions,
@@ -205,10 +293,17 @@ def main() -> None:
     show_controls_ui = True
     show_bones = args.show_bones
     show_ik_debug = args.show_ik_debug
+    show_motion_debug = False
     skin_backend = args.skinning_backend
     compare_rms = 0.0
     deform_rms = 0.0
     deform_max = 0.0
+    root_speed = 0.0
+    root_accel = 0.0
+    move_state = "IDLE"
+    balance_error = 0.0
+    foot_state_l = "PLANTED"
+    foot_state_r = "PLANTED"
     hand_targets: dict[str, np.ndarray | None] = {"l": None, "r": None}
     pending_hand_click: tuple[int, int] | None = None
     character_offset = np.zeros(3, dtype=np.float32)
@@ -273,6 +368,8 @@ def main() -> None:
                 show_bones = not show_bones
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_8:
                 show_ik_debug = not show_ik_debug
+            elif event.type == pygame.KEYDOWN and event.key == pygame.K_t:
+                show_motion_debug = not show_motion_debug
             elif event.type == pygame.KEYDOWN and event.key == pygame.K_c:
                 hand_targets["l"] = None
                 hand_targets["r"] = None
@@ -293,7 +390,24 @@ def main() -> None:
         camera.update(dt, keys)
 
         ai_sample = motion_ai.update(dt=dt, paused=paused)
-        character_offset += ai_sample.locomotion_delta
+        desired_root_velocity = ai_sample.locomotion_delta / max(1e-4, dt)
+        physics_out = motion_physics.update(
+            animation_target_pose=ai_sample.pose,
+            desired_root_velocity=desired_root_velocity,
+            character_offset=character_offset,
+            dt=dt,
+            paused=paused,
+            ground_y=ground_y,
+        )
+        character_offset += physics_out.root_delta
+
+        status = motion_physics.debug_status()
+        root_speed = float(status["root_speed"])
+        root_accel = float(status["root_accel"])
+        move_state = str(status["move_state"])
+        foot_state_l = str(status["foot_l"])
+        foot_state_r = str(status["foot_r"])
+        balance_error = float(status["balance_error"])
 
         pose_state = np.zeros((len(PROMPT_TOKENS) + 2,), dtype=np.float32)
         prompt_idx = PROMPT_TOKENS.get(ai_sample.prompt, PROMPT_TOKENS["idle"])
@@ -304,8 +418,8 @@ def main() -> None:
         world_rot, world_pos = animator.get_joint_world_transforms(
             dt=dt,
             paused=paused,
-            target_pose=ai_sample.pose,
-            blend=ai_sample.sequence_blend,
+            target_pose=physics_out.pose,
+            blend=1.0,
         )
 
         world_pos = (world_pos + character_offset[None, :]).astype(np.float32)
@@ -383,8 +497,8 @@ def main() -> None:
             end_idx = JOINT_INDEX[foot_name]
 
             curr_foot = world_pos[end_idx].copy()
-            target = curr_foot.copy()
-            target[1] = ground_y
+            side = "l" if foot_name.endswith("_l") else "r"
+            target = motion_physics.foot_target(side=side, current_foot=curr_foot, ground_y=ground_y)
             pole = world_pos[root_idx] + np.array([0.20 * sign, 0.22, -0.25], dtype=np.float32)
 
             chain = solve_limb_ik(
@@ -404,7 +518,14 @@ def main() -> None:
                 c = (0.22, 0.80, 0.98)
                 ik_debug_vertices.extend([*chain[0], *c, *chain[1], *c, *chain[1], *c, *chain[2], *c])
                 ik_debug_vertices.extend([*chain[0], 0.35, 0.95, 0.45, *pole, 0.35, 0.95, 0.45])
-                ik_debug_vertices.extend(_cross_marker(target, 0.04, (0.30, 0.85, 0.95)))
+                target_color = (0.26, 0.95, 0.42) if (
+                    (side == "l" and foot_state_l == "PLANTED")
+                    or (side == "r" and foot_state_r == "PLANTED")
+                ) else (0.30, 0.85, 0.95)
+                ik_debug_vertices.extend(_cross_marker(target, 0.04, target_color))
+
+        if show_motion_debug:
+            ik_debug_vertices.extend(motion_physics.build_debug_overlay_vertices())
         palette = build_matrix_palette(
             world_rot=world_rot,
             world_pos=world_pos,
@@ -445,7 +566,7 @@ def main() -> None:
         renderer.update_bone_lines(bone_positions=world_pos, parents=PARENTS, enabled=show_bones)
         renderer.update_ik_debug_lines(
             vertices=np.asarray(ik_debug_vertices, dtype=np.float32) if ik_debug_vertices else None,
-            enabled=show_ik_debug,
+            enabled=(show_ik_debug or show_motion_debug),
         )
 
         renderer.update_particles(
@@ -473,13 +594,17 @@ def main() -> None:
                 f"| Blend:{ai_sample.sequence_blend:0.2f} | t:{motion_ai.command_age:0.2f} "
                 f"| {fps:5.1f} FPS | Particles: {particle_data.local_positions.shape[0]}"
             )
+            title += " | JOINT:SPRING-DAMPER"
+            title += f" | ROOT:{move_state} v:{root_speed:0.2f} a:{root_accel:0.2f}"
+            title += f" | BAL err:{balance_error:0.3f}"
+            title += f" | FEET:L-{foot_state_l} R-{foot_state_r}"
             title += f" | DeformRMS:{deform_rms:0.5f} | DeformMax:{deform_max:0.5f}"
             if skin_backend == "compare":
                 title += f" | CPUvsGPU-RMS:{compare_rms:0.6f}"
             if show_controls_ui:
                 title += (
                     " | Buttons: [1 OFF] [2 BONE] [3 WEIGHT] [4 BONES] [5 GPU] [6 CPU] [7 CMP]"
-                    " | [8 IKDBG] [C CLR-HAND] | Prompt: / + Enter"
+                    " | [8 IKDBG] [T PHYDBG] [C CLR-HAND] | Prompt: / + Enter"
                     " | Hotkeys: [9 IDLE] [0 WALK] [LBRACKET WAVE] [RBRACKET DANCE] [BACKSLASH POINT]"
                     " | Prompt format: walk | dance:1.2"
                     " | Mouse RClick: Hand Target | Camera: Arrows"
