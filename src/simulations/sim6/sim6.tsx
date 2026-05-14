@@ -62,6 +62,7 @@ type BotAgent = {
 	enemyKills: number;
 	directionChanges: number;
 	deathPenaltyApplied: boolean;
+	heldRockId: string | null;
 };
 
 type AiProvider = "genetic" | "local" | "replicate" | "none";
@@ -166,6 +167,7 @@ const EXIT_RADIUS = 3.0;
 const BOT_COUNT = 10;
 const ELITE_COUNT = 3;
 const TOP_GREEN_COUNT = 4;
+const GUIDED_GENERATION_LIMIT = 20;
 
 function clamp(v: number, min: number, max: number): number {
 	return Math.min(max, Math.max(min, v));
@@ -206,6 +208,68 @@ type AiAction = {
 
 function round3(v: number): number {
 	return Math.round(v * 1000) / 1000;
+}
+
+type FitnessEvent = {
+	survivalSec?: number;
+	underThreat?: boolean;
+	dodgedThreat?: boolean;
+	damageTaken?: number;
+	enemyHit?: boolean;
+	successfulThrow?: boolean;
+	enemyKill?: boolean;
+	discoveredStone?: boolean;
+	pickedStone?: boolean;
+	explorationDelta?: number;
+	progressDelta?: number;
+	reachedCheckpoint?: boolean;
+	wastedThrow?: boolean;
+	stuck?: boolean;
+	idle?: boolean;
+	died?: boolean;
+};
+
+function computeFitness(currentFitness: number, event: FitnessEvent): number {
+	let next = currentFitness;
+
+	// Always reward survival a little
+	if (typeof event.survivalSec === "number" && Number.isFinite(event.survivalSec)) {
+		next += Math.max(0, event.survivalSec) * 0.2;
+	}
+
+	// Survival is the top priority under danger
+	if (event.underThreat) {
+		if (event.dodgedThreat) next += 2.0;
+		if (typeof event.damageTaken === "number") next -= event.damageTaken * 0.8;
+		if (event.enemyHit) next += 2.0;
+		if (event.successfulThrow) next += 3.0;
+		if (event.enemyKill) next += 8.0;
+	}
+
+	// Search mode: encourage finding useful resources
+	if (!event.underThreat) {
+		if (event.discoveredStone) next += 1.2;
+		if (event.pickedStone) next += 1.0;
+		if (typeof event.explorationDelta === "number") next += event.explorationDelta * 2.5;
+	}
+
+	// Checkpoint only matters when safe
+	if (!event.underThreat && typeof event.progressDelta === "number") {
+		next += event.progressDelta * 20.0;
+	}
+
+	// Big success reward
+	if (event.reachedCheckpoint) next += 80.0;
+
+	// Waste penalties
+	if (event.wastedThrow) next -= 1.5;
+	if (event.stuck) next -= 2.0;
+	if (event.idle) next -= 0.6;
+
+	// Strong death penalty
+	if (event.died) next -= 40.0;
+
+	return next;
 }
 
 type DenseNet = {
@@ -644,46 +708,32 @@ function ensureNonIdleAction(action: AiAction, bot: Bot, state?: any): AiAction 
 		typeof state.nearestEnemyForward === "number" &&
 		typeof state.nearestEnemyRight === "number"
 	) {
+		const enemyVeryClose = state.nearestEnemyDist < 1.8;
+		const shouldForceEscapeDrive = enemyVeryClose || lowProgress;
+
 		if (state.nearestEnemyForward > 0) {
-			next.backward = Math.max(next.backward, 0.7);
+			next.backward = Math.max(next.backward, shouldForceEscapeDrive ? 0.92 : 0.7);
 			next.forward = 0;
 		} else {
-			next.forward = Math.max(next.forward, 0.7);
+			next.forward = Math.max(next.forward, shouldForceEscapeDrive ? 0.92 : 0.7);
 			next.backward = 0;
 		}
+
 		if (state.nearestEnemyRight > 0) {
-			next.left = Math.max(next.left, 0.65);
+			next.left = Math.max(next.left, shouldForceEscapeDrive ? 0.28 : 0.65);
 			next.right = 0;
 		} else {
-			next.right = Math.max(next.right, 0.65);
+			next.right = Math.max(next.right, shouldForceEscapeDrive ? 0.28 : 0.65);
 			next.left = 0;
 		}
-		next.speed = Math.max(next.speed, 0.8);
-	}
 
-	// If gray/white stone is near and safe, bias toward collecting it.
-	if (
-		state &&
-		state.underThreat !== true &&
-		state.heldRock !== true &&
-		typeof state.nearestRockDist === "number" &&
-		typeof state.nearestRockForward === "number" &&
-		typeof state.nearestRockRight === "number" &&
-		state.nearestRockDist < 10
-	) {
-		if (state.nearestRockForward > 0) {
-			next.forward = Math.max(next.forward, 0.65);
-			next.backward = 0;
+		// When stuck/very close to enemy, prioritize translation over rotation.
+		if (shouldForceEscapeDrive) {
+			if (next.left > 0) next.left = Math.min(next.left, 0.35);
+			if (next.right > 0) next.right = Math.min(next.right, 0.35);
 		}
-		if (state.nearestRockRight > 0.1) {
-			next.right = Math.max(next.right, Math.min(1, Math.abs(state.nearestRockRight)));
-			next.left = 0;
-		} else if (state.nearestRockRight < -0.1) {
-			next.left = Math.max(next.left, Math.min(1, Math.abs(state.nearestRockRight)));
-			next.right = 0;
-		}
-		if (state.nearestRockDist < 2.3) next.pick = true;
-		next.speed = Math.max(next.speed, 0.6);
+
+		next.speed = Math.max(next.speed, shouldForceEscapeDrive ? 0.95 : 0.8);
 	}
 
 	// Direction exists but speed may be too low; nudge it so movement continues.
@@ -863,9 +913,11 @@ function BabylonWorld({
 
 		const hemi = new BABYLON.HemisphericLight("ambient", new BABYLON.Vector3(0, 1, 0), scene);
 		hemi.intensity = 0.9;
+		hemi.specular = BABYLON.Color3.Black();
 		const sun = new BABYLON.DirectionalLight("sun", new BABYLON.Vector3(-0.7, -1, -0.3), scene);
 		sun.position = new BABYLON.Vector3(50, 80, 10);
 		sun.intensity = 1.05;
+		sun.specular = BABYLON.Color3.Black();
 
 		const ground = BABYLON.MeshBuilder.CreateGround("ground", { width: WORLD_SIZE, height: WORLD_SIZE }, scene);
 		const groundMat = new BABYLON.StandardMaterial("groundMat", scene);
@@ -922,8 +974,8 @@ function BabylonWorld({
 		exit.position.set(EXIT_X, checkpointHeight * 0.5, EXIT_Z);
 		exit.isPickable = false;
 		const exitMat = new BABYLON.StandardMaterial("exitMat", scene);
-		exitMat.emissiveColor = BABYLON.Color3.FromHexString("#22c55e");
-		exitMat.diffuseColor = BABYLON.Color3.FromHexString("#16a34a");
+		exitMat.emissiveColor = BABYLON.Color3.FromHexString("#eab308");
+		exitMat.diffuseColor = BABYLON.Color3.FromHexString("#facc15");
 		exitMat.alpha = 0.3; // 70% transparent
 		exitMat.backFaceCulling = false; // visible from inside and outside
 		exit.material = exitMat;
@@ -1016,6 +1068,7 @@ function BabylonWorld({
 				enemyKills: 0,
 				directionChanges: 0,
 				deathPenaltyApplied: false,
+				heldRockId: null,
 			});
 		}
 
@@ -1051,6 +1104,16 @@ function BabylonWorld({
 		const rockMat = new BABYLON.StandardMaterial("rockMat", scene);
 		rockMat.diffuseColor = BABYLON.Color3.FromHexString("#94a3b8");
 
+		// Selection ring: flat torus on the ground around the selected bot (5-unit radius)
+		const selectionRing = BABYLON.MeshBuilder.CreateTorus("selectionRing", { diameter: 10, thickness: 0.18, tessellation: 48 }, scene);
+		selectionRing.rotation.x = Math.PI / 2;
+		selectionRing.isPickable = false;
+		const selectionRingMat = new BABYLON.StandardMaterial("selectionRingMat", scene);
+		selectionRingMat.diffuseColor = BABYLON.Color3.FromHexString("#3b82f6");
+		selectionRingMat.emissiveColor = BABYLON.Color3.FromHexString("#60a5fa");
+		selectionRingMat.alpha = 0.75;
+		selectionRing.material = selectionRingMat;
+
 		for (let i = 0; i < 16; i += 1) {
 			const id = randomId("rock");
 			rocks.push({
@@ -1075,8 +1138,15 @@ function BabylonWorld({
 				}
 				mesh.setEnabled(r.active);
 				if (!r.active) continue;
-				mesh.parent = null;
-				mesh.position.set(r.x, ROCK_RADIUS, r.z);
+				if (r.heldByBot) {
+					// Find holder and display rock above their head
+					const holder = botAgents.find((a) => a.heldRockId === r.id);
+					if (holder) {
+						mesh.position.set(holder.bot.x, 2.4, holder.bot.z);
+					}
+				} else {
+					mesh.position.set(r.x, ROCK_RADIUS, r.z);
+				}
 			}
 		};
 
@@ -1331,6 +1401,12 @@ function BabylonWorld({
 				a.enemyKills = 0;
 				a.directionChanges = 0;
 				a.deathPenaltyApplied = false;
+				// Release any held rock
+				if (a.heldRockId) {
+					const hr = rocks.find((r) => r.id === a.heldRockId);
+					if (hr) hr.heldByBot = false;
+					a.heldRockId = null;
+				}
 			}
 			enemies.length = 0;
 			for (const e of enemyMeshes.values()) e.dispose();
@@ -1519,25 +1595,28 @@ function BabylonWorld({
 								traces.set(i, { netInput, trace });
 
 								let action = outputsToAction(trace.out);
-								action = ensureNonIdleAction(action, viewer, compactState);
+								if (generation <= GUIDED_GENERATION_LIMIT) {
+									action = ensureNonIdleAction(action, viewer, compactState);
+								}
 								agent.action = action;
 
-								// Fitness starts at 0 and increases with requested behaviors.
-								const progressDelta = Number.isFinite(agent.prevExitDist) ? agent.prevExitDist - compactState.exitDist : 0;
-								agent.fitness += progressDelta > 0 ? progressDelta * 14 : progressDelta * 3;
+								// --- Fitness: reward survival time + enemy kills ---
+								// +1 per second alive (proportional to AI tick interval)
+								const aiTickIntervalSec = (performance.now() - lastAiAt) / 1000;
+								agent.fitness = computeFitness(agent.fitness, { survivalSec: aiTickIntervalSec });
 
-								const headingDot = clamp(agent.prevHeadingX * viewer.headingX + agent.prevHeadingZ * viewer.headingZ, -1, 1);
-								if (headingDot < 0.985 || Math.abs(action.right - action.left) > 0.2) {
-									agent.fitness += 0.12;
-									agent.directionChanges += 1;
-								}
-
+								// Bonus: actively dodge when threatened
 								if (compactState.underThreat) {
 									const moveForward = action.forward - action.backward;
 									const enemyForward = Number(compactState.nearestEnemyForward ?? 0);
 									if (moveForward * enemyForward < 0) {
-										agent.fitness += 0.9;
+										agent.fitness = computeFitness(agent.fitness, { underThreat: true, dodgedThreat: true });
 									}
+								}
+
+								const movementIntent = Math.abs(action.forward - action.backward) + Math.abs(action.right - action.left);
+								if (movementIntent < 0.08 && !compactState.underThreat) {
+									agent.fitness = computeFitness(agent.fitness, { idle: true, underThreat: false });
 								}
 
 								agent.prevExitDist = compactState.exitDist;
@@ -1719,13 +1798,67 @@ function BabylonWorld({
 						if (bot.energy <= 0) bot.health = clamp(bot.health - 10 * dt, 0, bot.maxHealth);
 						if (bot.health <= 0 && !agent.deathPenaltyApplied) {
 							agent.deathPenaltyApplied = true;
-							agent.fitness -= 50;
+							agent.fitness = computeFitness(agent.fitness, { died: true });
 							population[i].fitness = agent.fitness;
+						}
+
+						// --- Pick action: pick up nearest free rock within 1.5 units ---
+						const PICK_RANGE = 1.5;
+						const THROW_AUTO_RANGE = 5;
+						if (action.pick && !agent.heldRockId) {
+							let bestRockDist = PICK_RANGE * PICK_RANGE;
+							let bestRock: typeof rocks[0] | null = null;
+							for (const r of rocks) {
+								if (!r.active || r.heldByBot) continue;
+								const rd = dist2({ x: bot.x, z: bot.z }, { x: r.x, z: r.z });
+								if (rd < bestRockDist) { bestRockDist = rd; bestRock = r; }
+							}
+							if (bestRock) {
+								bestRock.heldByBot = true;
+								agent.heldRockId = bestRock.id;
+							}
+						}
+
+						// --- Auto-throw: if holding a rock and an enemy is within 5 units, throw at it ---
+						if (agent.heldRockId) {
+							let nearestEnemy: typeof enemies[0] | null = null;
+							let nearestEnemyDist2 = THROW_AUTO_RANGE * THROW_AUTO_RANGE;
+							for (const e of enemies) {
+								if (!e.alive) continue;
+								const ed = dist2({ x: bot.x, z: bot.z }, { x: e.x, z: e.z });
+								if (ed < nearestEnemyDist2) { nearestEnemyDist2 = ed; nearestEnemy = e; }
+							}
+							if (nearestEnemy) {
+								// Throw: launch rock toward enemy
+								const toEnemy = normalize(nearestEnemy.x - bot.x, nearestEnemy.z - bot.z);
+								const hr = rocks.find((r) => r.id === agent.heldRockId);
+								if (hr) {
+									const THROW_SPEED = 14;
+									hr.x = bot.x + bot.headingX * (BOT_RADIUS + ROCK_RADIUS + 0.1);
+									hr.z = bot.z + bot.headingZ * (BOT_RADIUS + ROCK_RADIUS + 0.1);
+									hr.vx = toEnemy.x * THROW_SPEED;
+									hr.vz = toEnemy.z * THROW_SPEED;
+									hr.heldByBot = false;
+								}
+								agent.heldRockId = null;
+							} else if (action.throw) {
+								// Manual throw in heading direction
+								const hr = rocks.find((r) => r.id === agent.heldRockId);
+								if (hr) {
+									const THROW_SPEED = 14;
+									hr.x = bot.x + bot.headingX * (BOT_RADIUS + ROCK_RADIUS + 0.1);
+									hr.z = bot.z + bot.headingZ * (BOT_RADIUS + ROCK_RADIUS + 0.1);
+									hr.vx = bot.headingX * THROW_SPEED;
+									hr.vz = bot.headingZ * THROW_SPEED;
+									hr.heldByBot = false;
+								}
+								agent.heldRockId = null;
+							}
 						}
 
 						if (dist2({ x: bot.x, z: bot.z }, { x: EXIT_X, z: EXIT_Z }) < EXIT_RADIUS * EXIT_RADIUS) {
 							bot.escaped = true;
-							agent.fitness += 90;
+							agent.fitness = computeFitness(agent.fitness, { reachedCheckpoint: true, underThreat: false });
 							population[i].fitness = agent.fitness;
 						}
 					}
@@ -1780,11 +1913,14 @@ function BabylonWorld({
 							if (botSpeed > 2.25) {
 								e.alive = false;
 								a.enemyKills += 1;
-								a.fitness += 30;
+								a.fitness = computeFitness(a.fitness, { underThreat: true, enemyKill: true, enemyHit: true });
 								population[i].fitness = a.fitness;
 								break;
 							}
-							a.bot.health = clamp(a.bot.health - s.enemyDamagePerSec * dt, 0, a.bot.maxHealth);
+							const damage = s.enemyDamagePerSec * dt;
+							a.bot.health = clamp(a.bot.health - damage, 0, a.bot.maxHealth);
+							a.fitness = computeFitness(a.fitness, { underThreat: true, damageTaken: damage });
+							population[i].fitness = a.fitness;
 						}
 					}
 
@@ -1798,6 +1934,43 @@ function BabylonWorld({
 							r.vx = 0;
 							r.vz = 0;
 						}
+						// Check if fast-moving rock hits an enemy
+						const rockSpeed2 = r.vx * r.vx + r.vz * r.vz;
+						if (rockSpeed2 > 4) {
+							for (let ei = 0; ei < enemies.length; ei += 1) {
+								const e = enemies[ei];
+								if (!e.alive) continue;
+								if (dist2({ x: r.x, z: r.z }, { x: e.x, z: e.z }) < (ROCK_RADIUS + ENEMY_RADIUS) ** 2) {
+									e.alive = false;
+									r.vx = 0; r.vz = 0;
+									// Credit the bot that threw this rock
+									for (let bi = 0; bi < botAgents.length; bi += 1) {
+										// We can't track exactly who threw it after release,
+										// so credit the nearest living bot as the thrower
+									}
+									// Give kill credit to the nearest bot that is alive and closest
+									let closestBot = -1;
+									let closestDist = Number.POSITIVE_INFINITY;
+									for (let bi = 0; bi < botAgents.length; bi += 1) {
+										const ba = botAgents[bi];
+										if (ba.bot.health <= 0 || ba.bot.escaped) continue;
+										const bd = dist2({ x: ba.bot.x, z: ba.bot.z }, { x: r.x, z: r.z });
+										if (bd < closestDist) { closestDist = bd; closestBot = bi; }
+									}
+									if (closestBot >= 0 && closestDist < 10 * 10) {
+										botAgents[closestBot].enemyKills += 1;
+										botAgents[closestBot].fitness = computeFitness(botAgents[closestBot].fitness, {
+											underThreat: true,
+											enemyKill: true,
+											successfulThrow: true,
+											enemyHit: true,
+										});
+										population[closestBot].fitness = botAgents[closestBot].fitness;
+									}
+									break;
+								}
+							}
+						}
 					}
 				}
 			}
@@ -1807,6 +1980,15 @@ function BabylonWorld({
 				a.mesh.position.set(a.bot.x, 1.1, a.bot.z);
 				a.mesh.rotation.y = Math.atan2(a.bot.headingX, a.bot.headingZ);
 				a.mesh.material = i === selectedBotIdx ? selectedMat : topGreenIdxSet.has(i) ? championMat : botMat;
+			}
+
+			// Update selection ring to follow selected bot
+			const selBot = botAgents[selectedBotIdx];
+			if (selBot && selBot.bot.health > 0 && !selBot.bot.escaped) {
+				selectionRing.setEnabled(true);
+				selectionRing.position.set(selBot.bot.x, 0.08, selBot.bot.z);
+			} else {
+				selectionRing.setEnabled(false);
 			}
 
 			syncEnemies();
