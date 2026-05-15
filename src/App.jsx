@@ -5,6 +5,7 @@ import NeuralVisionSim3D from './simulations/sim3/sim3.tsx'
 import MazeNeuralVisionSim3D from './simulations/sim4/sim4.tsx'
 import CityEscapeSim3D from './simulations/sim15/sim15.tsx'
 import CityEscapeGeneticSim3D from './simulations/sim6/sim6.tsx'
+import SplatWebSim3D from './simulations/splatsWeb/splatsWeb.tsx'
 import './App.css'
 
 const simulations = [
@@ -48,7 +49,14 @@ const simulations = [
     title: 'City Escape Genetic NN 3D',
     description: 'Large neural network trained with genetic evolution from bot vision + instruction features; outputs direct bot actions in real time.',
     status: 'New',
-		docsPath: '/docs/sim15-city-escape-ai.md',
+		docsPath: '/docs/sim15-city-escape-genetic.md',
+  },
+  {
+    id: 'splats-webgl-face',
+    title: 'Gaussian Splat WebGL',
+    description: 'Structured facial topology splat renderer (WebGL) with separate face/body shading and readable motion silhouette.',
+    status: 'New',
+		docsPath: '/docs/sim4-survival.md',
   },
 ]
 
@@ -112,6 +120,7 @@ function SimulationView() {
   if (simulationId === 'maze-neural-vision-ga-3d') simulation = <MazeNeuralVisionSim3D />
   if (simulationId === 'city-escape-ai-3d') simulation = <CityEscapeSim3D />
   if (simulationId === 'city-escape-genetic-3d') simulation = <CityEscapeGeneticSim3D />
+  if (simulationId === 'splats-webgl-face') simulation = <SplatWebSim3D />
 
   const validIds = new Set(simulations.map((s) => s.id))
   if (!simulationId || !validIds.has(simulationId)) {

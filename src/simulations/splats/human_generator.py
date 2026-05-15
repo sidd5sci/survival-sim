@@ -23,6 +23,7 @@ class HumanParticleData:
     joint_indices: np.ndarray | None = None
     bind_world_positions: np.ndarray | None = None
     rest_joint_positions: np.ndarray | None = None
+    face_mask: np.ndarray | None = None
 
     def __post_init__(self) -> None:
         self.local_positions = self.local_positions.astype(np.float32, copy=False)
@@ -59,6 +60,11 @@ class HumanParticleData:
             ).astype(np.float32, copy=False)
         else:
             self.bind_world_positions = self.bind_world_positions.astype(np.float32, copy=False)
+
+        if self.face_mask is None:
+            self.face_mask = np.zeros((self.local_positions.shape[0],), dtype=bool)
+        else:
+            self.face_mask = self.face_mask.astype(bool, copy=False)
 
 
 def _pack_particle_data(
@@ -115,42 +121,16 @@ def generate_face_splats_from_image(
 
     rgb = np.asarray(img, dtype=np.float32) / 255.0
 
-    # Slightly oversample and keep points inside an oval face mask.
-    candidate = int(face_particle_count * 2.2)
-    u = rng.random(candidate, dtype=np.float32)
-    v = rng.random(candidate, dtype=np.float32)
+    positions, uv, sizes, brightness, region_base_colors = _build_face_topology(rng, face_particle_count)
 
-    ex = (u - 0.5) / 0.46
-    ey = (v - 0.50) / 0.56
-    mask = (ex * ex + ey * ey) <= 1.0
-    u = u[mask]
-    v = v[mask]
+    px = np.clip((uv[:, 0] * 255.0).astype(np.int32), 0, 255)
+    py = np.clip((uv[:, 1] * 255.0).astype(np.int32), 0, 255)
+    sampled = rgb[py, px].astype(np.float32)
 
-    if u.size < face_particle_count:
-        deficit = face_particle_count - u.size
-        u = np.concatenate([u, rng.random(deficit, dtype=np.float32)])
-        v = np.concatenate([v, rng.random(deficit, dtype=np.float32)])
-
-    idx = rng.choice(u.size, size=face_particle_count, replace=False)
-    u = u[idx]
-    v = v[idx]
-
-    px = np.clip((u * 255.0).astype(np.int32), 0, 255)
-    py = np.clip((v * 255.0).astype(np.int32), 0, 255)
-    colors = rgb[py, px].astype(np.float32)
-
-    # Map image UVs to head-local curved patch: X lateral, Y vertical, Z forward.
-    x = (u - 0.5) * 0.20
-    y = (0.5 - v) * 0.24
-    curvature = (x / 0.11) ** 2 + (y / 0.13) ** 2
-    z = 0.09 - 0.018 * curvature
-
-    positions = np.stack([x, y, z], axis=1).astype(np.float32)
-
-    # Point size/brightness tuned for soft portrait-like face splats.
-    sizes = rng.uniform(2.6, 5.2, size=face_particle_count).astype(np.float32)
+    # Blend sampled image color with region priors to preserve feature readability.
+    colors = np.clip(0.65 * sampled + 0.35 * region_base_colors, 0.0, 1.0).astype(np.float32)
     luma = colors @ np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
-    brightness = (0.68 + 0.70 * luma).astype(np.float32)
+    brightness = np.clip(0.52 * brightness + 0.48 * (0.70 + 0.70 * luma), 0.45, 1.35).astype(np.float32)
 
     joints = np.full(face_particle_count, JOINT_INDEX["head"], dtype=np.int32)
 
@@ -160,6 +140,7 @@ def generate_face_splats_from_image(
         sizes=sizes,
         brightness=brightness,
         joint_indices=joints,
+        face_mask=np.ones((face_particle_count,), dtype=bool),
     )
 
 
@@ -183,7 +164,97 @@ def attach_face_splats(
         bone_indices=np.concatenate([base.bone_indices, face.bone_indices], axis=0),
         bone_weights=np.concatenate([base.bone_weights, face.bone_weights], axis=0),
         joint_indices=np.concatenate([base.joint_indices, face.joint_indices], axis=0),
+        face_mask=np.concatenate([base.face_mask, face.face_mask], axis=0),
     )
+
+
+def _sample_face_patch(
+    rng: np.random.Generator,
+    count: int,
+    center: tuple[float, float, float],
+    radii: tuple[float, float, float],
+) -> np.ndarray:
+    pts = _sample_ellipsoid(rng, count, radii)
+    return (pts + np.asarray(center, dtype=np.float32)[None, :]).astype(np.float32)
+
+
+def _face_uv_from_positions(positions: np.ndarray) -> np.ndarray:
+    # Map head-local face coordinates to image UVs for photo-driven coloring.
+    u = np.clip(0.5 + positions[:, 0] / 0.24, 0.0, 1.0)
+    v = np.clip(0.5 - positions[:, 1] / 0.26, 0.0, 1.0)
+    return np.stack([u, v], axis=1).astype(np.float32)
+
+
+def _build_face_topology(
+    rng: np.random.Generator,
+    face_particle_count: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    # Region specs encode a procedural landmark-like facial topology.
+    specs = [
+        ("forehead", 0.14, (0.00, 0.10, 0.083), (0.095, 0.060, 0.034), (0.83, 0.71, 0.63), (2.8, 4.4), (0.82, 1.05)),
+        ("cheek_l", 0.11, (-0.067, 0.01, 0.098), (0.052, 0.045, 0.034), (0.86, 0.72, 0.63), (3.0, 4.8), (0.86, 1.08)),
+        ("cheek_r", 0.11, (0.067, 0.01, 0.098), (0.052, 0.045, 0.034), (0.86, 0.72, 0.63), (3.0, 4.8), (0.86, 1.08)),
+        ("nose_bridge", 0.08, (0.00, 0.035, 0.114), (0.018, 0.050, 0.013), (0.84, 0.71, 0.63), (2.2, 3.6), (0.82, 1.06)),
+        ("nose_tip", 0.06, (0.00, -0.012, 0.128), (0.020, 0.018, 0.016), (0.86, 0.72, 0.64), (2.4, 3.9), (0.84, 1.10)),
+        ("jaw_l", 0.08, (-0.072, -0.080, 0.074), (0.050, 0.040, 0.030), (0.79, 0.67, 0.59), (3.2, 5.0), (0.72, 0.94)),
+        ("jaw_r", 0.08, (0.072, -0.080, 0.074), (0.050, 0.040, 0.030), (0.79, 0.67, 0.59), (3.2, 5.0), (0.72, 0.94)),
+        ("chin", 0.07, (0.00, -0.110, 0.086), (0.045, 0.030, 0.028), (0.81, 0.69, 0.60), (3.0, 4.8), (0.74, 0.96)),
+        ("mouth_upper", 0.04, (0.00, -0.046, 0.114), (0.040, 0.012, 0.010), (0.66, 0.40, 0.40), (1.6, 2.8), (0.64, 0.90)),
+        ("mouth_lower", 0.04, (0.00, -0.064, 0.112), (0.038, 0.013, 0.010), (0.62, 0.36, 0.36), (1.6, 2.8), (0.60, 0.88)),
+        ("eye_socket_l", 0.05, (-0.038, 0.022, 0.101), (0.028, 0.016, 0.016), (0.48, 0.38, 0.36), (1.5, 2.5), (0.56, 0.78)),
+        ("eye_socket_r", 0.05, (0.038, 0.022, 0.101), (0.028, 0.016, 0.016), (0.48, 0.38, 0.36), (1.5, 2.5), (0.56, 0.78)),
+        ("eyelid_l", 0.03, (-0.038, 0.032, 0.112), (0.024, 0.010, 0.010), (0.58, 0.45, 0.42), (1.2, 2.2), (0.62, 0.86)),
+        ("eyelid_r", 0.03, (0.038, 0.032, 0.112), (0.024, 0.010, 0.010), (0.58, 0.45, 0.42), (1.2, 2.2), (0.62, 0.86)),
+        ("sclera_l", 0.015, (-0.038, 0.020, 0.121), (0.017, 0.011, 0.010), (0.90, 0.92, 0.94), (0.9, 1.6), (0.95, 1.30)),
+        ("sclera_r", 0.015, (0.038, 0.020, 0.121), (0.017, 0.011, 0.010), (0.90, 0.92, 0.94), (0.9, 1.6), (0.95, 1.30)),
+        ("iris_l", 0.005, (-0.038, 0.020, 0.130), (0.008, 0.008, 0.004), (0.15, 0.30, 0.42), (0.7, 1.1), (0.92, 1.24)),
+        ("iris_r", 0.005, (0.038, 0.020, 0.130), (0.008, 0.008, 0.004), (0.15, 0.30, 0.42), (0.7, 1.1), (0.92, 1.24)),
+    ]
+
+    n = max(400, int(face_particle_count))
+    weights = np.asarray([s[1] for s in specs], dtype=np.float32)
+    weights = weights / np.sum(weights)
+
+    counts = np.maximum(40, (weights * n).astype(np.int32))
+    # Keep tiny regions tiny for detail control.
+    tiny = {"iris_l", "iris_r", "sclera_l", "sclera_r", "eyelid_l", "eyelid_r", "mouth_upper", "mouth_lower"}
+    for i, spec in enumerate(specs):
+        if spec[0] in tiny:
+            counts[i] = max(24, int(0.55 * counts[i]))
+
+    total = int(np.sum(counts))
+    if total > n:
+        scale = n / max(1.0, float(total))
+        counts = np.maximum(12, (counts.astype(np.float32) * scale).astype(np.int32))
+    elif total < n:
+        counts[np.argmax(counts)] += (n - total)
+
+    pos_parts: list[np.ndarray] = []
+    color_parts: list[np.ndarray] = []
+    size_parts: list[np.ndarray] = []
+    bright_parts: list[np.ndarray] = []
+
+    for count, spec in zip(counts, specs):
+        _, _, center, radii, base_color, size_range, bright_range = spec
+        p = _sample_face_patch(rng, int(count), center=center, radii=radii)
+
+        c_noise = (rng.random((int(count), 3), dtype=np.float32) - 0.5) * 0.06
+        c = np.clip(np.asarray(base_color, dtype=np.float32)[None, :] + c_noise, 0.0, 1.0)
+        s = rng.uniform(size_range[0], size_range[1], size=int(count)).astype(np.float32)
+        b = rng.uniform(bright_range[0], bright_range[1], size=int(count)).astype(np.float32)
+
+        pos_parts.append(p)
+        color_parts.append(c)
+        size_parts.append(s)
+        bright_parts.append(b)
+
+    positions = np.concatenate(pos_parts, axis=0).astype(np.float32)
+    colors = np.concatenate(color_parts, axis=0).astype(np.float32)
+    sizes = np.concatenate(size_parts, axis=0).astype(np.float32)
+    brightness = np.concatenate(bright_parts, axis=0).astype(np.float32)
+    uv = _face_uv_from_positions(positions)
+
+    return positions, uv, sizes, brightness, colors
 
 
 def _sample_ellipsoid(rng: np.random.Generator, count: int, radii: tuple[float, float, float]) -> np.ndarray:
@@ -272,11 +343,12 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
     joints: list[np.ndarray] = []
 
     # Soft allocation ratios by body part.
-    n_head = int(total_particles * 0.09)
+    n_head = int(total_particles * 0.06)
+    n_face = int(total_particles * 0.04)
     n_torso = int(total_particles * 0.31)
     n_arms = int(total_particles * 0.25)
     n_legs = int(total_particles * 0.29)
-    n_extras = total_particles - (n_head + n_torso + n_arms + n_legs)
+    n_extras = total_particles - (n_head + n_face + n_torso + n_arms + n_legs)
 
     # Head
     _append_part(
@@ -435,4 +507,28 @@ def generate_human_particles(total_particles: int = 14000, seed: int = 7) -> Hum
             rng=rng,
         )
 
-    return _pack_particle_data(positions, colors, sizes, brightness, joints)
+    # Structured facial topology pass (landmark-style regions), rendered as face splats.
+    face_positions, _, face_sizes, face_brightness, face_colors = _build_face_topology(rng, n_face)
+    _append_part(
+        positions,
+        colors,
+        sizes,
+        brightness,
+        joints,
+        face_positions,
+        color_rgb=(0.82, 0.70, 0.62),
+        size_range=(1.2, 3.8),
+        brightness_range=(0.76, 1.18),
+        joint_name="head",
+        rng=rng,
+    )
+
+    # Replace default color/size/brightness for the face block with region-authored values.
+    face_count = face_positions.shape[0]
+    colors[-1] = face_colors
+    sizes[-1] = face_sizes
+    brightness[-1] = face_brightness
+
+    out = _pack_particle_data(positions, colors, sizes, brightness, joints)
+    out.face_mask[-face_count:] = True
+    return out

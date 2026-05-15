@@ -138,8 +138,11 @@ class GaussianSplatRenderer:
         shader_dir = Path(__file__).resolve().parent / "shaders"
         vertex_src = (shader_dir / "vertex.glsl").read_text(encoding="utf-8")
         fragment_src = (shader_dir / "fragment.glsl").read_text(encoding="utf-8")
+        face_vertex_src = (shader_dir / "face_vertex.glsl").read_text(encoding="utf-8")
+        face_fragment_src = (shader_dir / "face_fragment.glsl").read_text(encoding="utf-8")
 
         self.program = self.ctx.program(vertex_shader=vertex_src, fragment_shader=fragment_src)
+        self.face_program = self.ctx.program(vertex_shader=face_vertex_src, fragment_shader=face_fragment_src)
 
         # Lightweight line program for orientation helpers (wire mesh + axes).
         self.line_program = self.ctx.program(
@@ -199,6 +202,25 @@ class GaussianSplatRenderer:
                 )
             ],
         )
+        self.face_capacity = max(16384, max_particles // 4)
+        self.face_vbo = self.ctx.buffer(reserve=self.face_capacity * particle_dtype.itemsize, dynamic=True)
+        self.face_vao = self.ctx.vertex_array(
+            self.face_program,
+            [
+                (
+                    self.face_vbo,
+                    "3f 3f 3f 3f 1f 1f 4f 4f",
+                    "in_bind_pos",
+                    "in_cpu_pos",
+                    "in_deform",
+                    "in_color",
+                    "in_size",
+                    "in_brightness",
+                    "in_bone_idx",
+                    "in_bone_w",
+                )
+            ],
+        )
 
         self.grid_vbo, self.grid_vao, self.grid_vertex_count = self._build_wire_mesh_plane(size=4.0, step=0.25)
         self.bone_vbo = self.ctx.buffer(reserve=4096, dynamic=True)
@@ -229,7 +251,9 @@ class GaussianSplatRenderer:
         self.ik_vertex_count = 0
 
         self.particle_count = 0
+        self.face_particle_count = 0
         self.program["u_skinning_backend"].value = 1
+        self.face_program["u_skinning_backend"].value = 1
 
     def _build_wire_mesh_plane(self, size: float, step: float) -> tuple[moderngl.Buffer, moderngl.VertexArray, int]:
         verts: list[float] = []
@@ -290,23 +314,52 @@ class GaussianSplatRenderer:
         brightness: np.ndarray,
         bone_indices: np.ndarray,
         bone_weights: np.ndarray,
+        face_mask: np.ndarray | None = None,
     ) -> None:
         count = bind_world_positions.shape[0]
         if count > self.max_particles:
             raise ValueError(f"Particle count {count} exceeds max_particles={self.max_particles}")
 
-        packed = np.empty(count, dtype=self._particle_dtype)
-        packed["in_bind_pos"] = bind_world_positions.astype(np.float32, copy=False)
-        packed["in_cpu_pos"] = cpu_positions.astype(np.float32, copy=False)
-        packed["in_deform"] = deformation_offsets.astype(np.float32, copy=False)
-        packed["in_color"] = colors.astype(np.float32, copy=False)
-        packed["in_size"] = sizes.astype(np.float32, copy=False)
-        packed["in_brightness"] = brightness.astype(np.float32, copy=False)
-        packed["in_bone_idx"] = bone_indices.astype(np.float32, copy=False)
-        packed["in_bone_w"] = bone_weights.astype(np.float32, copy=False)
+        if face_mask is None:
+            face_mask_arr = np.zeros((count,), dtype=bool)
+        else:
+            face_mask_arr = np.asarray(face_mask, dtype=bool)
+            if face_mask_arr.shape[0] != count:
+                raise ValueError("face_mask must have shape (N,) matching particle count")
 
-        self.vbo.write(packed.tobytes(), offset=0)
-        self.particle_count = count
+        body_mask = ~face_mask_arr
+        body_count = int(np.sum(body_mask))
+        face_count = int(np.sum(face_mask_arr))
+
+        if face_count > self.face_capacity:
+            raise ValueError(f"Face particle count {face_count} exceeds face_capacity={self.face_capacity}")
+
+        if body_count > 0:
+            packed = np.empty(body_count, dtype=self._particle_dtype)
+            packed["in_bind_pos"] = bind_world_positions[body_mask].astype(np.float32, copy=False)
+            packed["in_cpu_pos"] = cpu_positions[body_mask].astype(np.float32, copy=False)
+            packed["in_deform"] = deformation_offsets[body_mask].astype(np.float32, copy=False)
+            packed["in_color"] = colors[body_mask].astype(np.float32, copy=False)
+            packed["in_size"] = sizes[body_mask].astype(np.float32, copy=False)
+            packed["in_brightness"] = brightness[body_mask].astype(np.float32, copy=False)
+            packed["in_bone_idx"] = bone_indices[body_mask].astype(np.float32, copy=False)
+            packed["in_bone_w"] = bone_weights[body_mask].astype(np.float32, copy=False)
+            self.vbo.write(packed.tobytes(), offset=0)
+
+        if face_count > 0:
+            packed_face = np.empty(face_count, dtype=self._particle_dtype)
+            packed_face["in_bind_pos"] = bind_world_positions[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_cpu_pos"] = cpu_positions[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_deform"] = deformation_offsets[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_color"] = colors[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_size"] = sizes[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_brightness"] = brightness[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_bone_idx"] = bone_indices[face_mask_arr].astype(np.float32, copy=False)
+            packed_face["in_bone_w"] = bone_weights[face_mask_arr].astype(np.float32, copy=False)
+            self.face_vbo.write(packed_face.tobytes(), offset=0)
+
+        self.particle_count = body_count
+        self.face_particle_count = face_count
 
     def update_skinning_uniforms(self, matrix_palette: np.ndarray, backend: str = "gpu") -> None:
         palette = matrix_palette.astype(np.float32, copy=False)
@@ -314,6 +367,8 @@ class GaussianSplatRenderer:
             raise ValueError(f"matrix_palette must have shape ({self.max_bones}, 4, 4)")
         self.program["u_bone_mats"].write(palette.transpose(0, 2, 1).tobytes())
         self.program["u_skinning_backend"].value = 1 if backend == "gpu" else 0
+        self.face_program["u_bone_mats"].write(palette.transpose(0, 2, 1).tobytes())
+        self.face_program["u_skinning_backend"].value = 1 if backend == "gpu" else 0
 
     def update_bone_lines(self, bone_positions: np.ndarray, parents: np.ndarray, enabled: bool) -> None:
         if not enabled:
@@ -366,6 +421,9 @@ class GaussianSplatRenderer:
         self.program["u_mvp"].write(mvp.T.astype("f4").tobytes())
         self.program["u_view"].write(view.T.astype("f4").tobytes())
         self.program["u_point_scale"].value = float(point_scale)
+        self.face_program["u_mvp"].write(mvp.T.astype("f4").tobytes())
+        self.face_program["u_view"].write(view.T.astype("f4").tobytes())
+        self.face_program["u_point_scale"].value = float(point_scale)
 
         # Draw orientation guides first so splats naturally overlay them.
         self.line_program["u_mvp"].write(mvp.T.astype("f4").tobytes())
@@ -375,7 +433,10 @@ class GaussianSplatRenderer:
         if show_ik_debug and self.ik_vertex_count > 0:
             self.ik_vao.render(mode=moderngl.LINES, vertices=self.ik_vertex_count)
 
-        self.vao.render(mode=moderngl.POINTS, vertices=self.particle_count)
+        if self.particle_count > 0:
+            self.vao.render(mode=moderngl.POINTS, vertices=self.particle_count)
+        if self.face_particle_count > 0:
+            self.face_vao.render(mode=moderngl.POINTS, vertices=self.face_particle_count)
         pygame.display.flip()
 
     def shutdown(self) -> None:
@@ -386,6 +447,9 @@ class GaussianSplatRenderer:
         self.grid_vao.release()
         self.grid_vbo.release()
         self.line_program.release()
+        self.face_vao.release()
+        self.face_vbo.release()
+        self.face_program.release()
         self.vao.release()
         self.vbo.release()
         self.program.release()

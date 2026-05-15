@@ -579,6 +579,7 @@ def main() -> None:
             brightness=particle_data.brightness,
             bone_indices=particle_data.bone_indices,
             bone_weights=particle_data.bone_weights,
+            face_mask=particle_data.face_mask,
         )
         renderer.render(camera, show_bones=show_bones, show_ik_debug=show_ik_debug)
 
