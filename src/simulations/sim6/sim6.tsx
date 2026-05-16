@@ -27,6 +27,13 @@ type Rock = {
 	active: boolean;
 };
 
+type Food = {
+	id: string;
+	x: number;
+	z: number;
+	active: boolean;
+};
+
 type Obstacle = {
 	id: string;
 	x: number;
@@ -63,6 +70,7 @@ type BotAgent = {
 	directionChanges: number;
 	deathPenaltyApplied: boolean;
 	heldRockId: string | null;
+	exploredCells: Set<number>;
 };
 
 type AiProvider = "genetic" | "local" | "replicate" | "none";
@@ -160,6 +168,9 @@ const HALF = WORLD_SIZE / 2;
 const BOT_RADIUS = 0.6;
 const ENEMY_RADIUS = 0.6;
 const ROCK_RADIUS = 0.28;
+const FOOD_RADIUS = 0.22;
+const FOOD_ENERGY_GAIN = 0.5;
+const FOOD_SPAWN_PER_SEC = 2;
 
 const EXIT_X = HALF - 6;
 const EXIT_Z = HALF - 6;
@@ -222,7 +233,7 @@ type FitnessEvent = {
 	pickedStone?: boolean;
 	explorationDelta?: number;
 	progressDelta?: number;
-	reachedCheckpoint?: boolean;
+	ateFood?: boolean;
 	wastedThrow?: boolean;
 	stuck?: boolean;
 	idle?: boolean;
@@ -246,11 +257,15 @@ function computeFitness(currentFitness: number, event: FitnessEvent): number {
 		if (event.enemyKill) next += 8.0;
 	}
 
+	// Exploration: always reward discovering new areas, regardless of threat
+	if (typeof event.explorationDelta === "number") {
+		next += event.explorationDelta * 4.0;
+	}
+
 	// Search mode: encourage finding useful resources
 	if (!event.underThreat) {
 		if (event.discoveredStone) next += 1.2;
 		if (event.pickedStone) next += 1.0;
-		if (typeof event.explorationDelta === "number") next += event.explorationDelta * 2.5;
 	}
 
 	// Checkpoint only matters when safe
@@ -258,8 +273,8 @@ function computeFitness(currentFitness: number, event: FitnessEvent): number {
 		next += event.progressDelta * 20.0;
 	}
 
-	// Big success reward
-	if (event.reachedCheckpoint) next += 80.0;
+	// Big rewards
+	if (event.ateFood) next += 2.5;
 
 	// Waste penalties
 	if (event.wastedThrow) next -= 1.5;
@@ -313,10 +328,12 @@ type SerializedGeneration = {
 	genomes: Array<{ id: string; fitness: number; net: SerializedDenseNet }>;
 };
 
-const VISION_FEATURE_DIM = 16;
-const VISION_FEATURE_COUNT = VISION_FEATURE_DIM * VISION_FEATURE_DIM;
-const INSTRUCTION_FEATURE_COUNT = 12;
-const STATE_FEATURE_COUNT = 14;
+const VISION_RES = 16; // rendered image resolution for color-based perception
+// Perceptual features extracted from the rendered image:
+// 3 object types × 3 values = 9
+// [food_seen, food_hAngle, food_dist, enemy_seen, enemy_hAngle, enemy_dist, rock_seen, rock_hAngle, rock_dist]
+const PERCEPT_FEATURE_COUNT = 9;
+const STATE_FEATURE_COUNT = 5; // health, energy, organs, speed, underThreat
 const ACTION_OUTPUT_COUNT = 11;
 const ACTION_OUTPUT_NAMES = ["left", "right", "forward", "backward", "speed", "pick", "throw", "grow", "seesGreenCheckpoint", "seesStone", "seesRedEnemy"];
 const ACTION_OUTPUT_SHORT = ["L", "R", "F", "B", "Sp", "Pk", "Th", "Gr", "Cp", "St", "En"];
@@ -363,7 +380,7 @@ function randWeight(scale = 0.2): number {
 	return (Math.random() * 2 - 1) * scale;
 }
 
-function createDenseNet(inputSize: number, h1Size = 128, h2Size = 64, outputSize = ACTION_OUTPUT_COUNT): DenseNet {
+function createDenseNet(inputSize: number, h1Size = 32, h2Size = 16, outputSize = ACTION_OUTPUT_COUNT): DenseNet {
 	const net: DenseNet = {
 		inputSize,
 		h1Size,
@@ -517,74 +534,74 @@ function forwardDenseNetTrace(net: DenseNet, input: Float32Array): { h1: Float32
 	return { h1, h2, out };
 }
 
-function instructionToFeatures(text: string): Float32Array {
-	const t = text.toLowerCase();
-	const f = new Float32Array(INSTRUCTION_FEATURE_COUNT);
-	f[0] = /(green|checkpoint|exit)/.test(t) ? 1 : 0;
-	f[1] = /(fast|quick|as fast)/.test(t) ? 1 : 0;
-	f[2] = /(enemy|red|run away|avoid)/.test(t) ? 1 : 0;
-	f[3] = /(stone|rock|gray|white|collect|pick)/.test(t) ? 1 : 0;
-	f[4] = /(explore|scan|look around)/.test(t) ? 1 : 0;
-	f[5] = /(left)/.test(t) ? 1 : 0;
-	f[6] = /(right)/.test(t) ? 1 : 0;
-	f[7] = /(survive|health|energy)/.test(t) ? 1 : 0;
-	f[8] = /(throw)/.test(t) ? 1 : 0;
-	f[9] = /(grow|organ)/.test(t) ? 1 : 0;
-	f[10] = /(vision|image)/.test(t) ? 1 : 0;
-	f[11] = 1;
-	return f;
-}
+// Deterministic color-based perception: scan the rendered image for known object colors.
+// Returns 9 values: [food_seen, food_hAngle, food_dist, enemy_seen, enemy_hAngle, enemy_dist, rock_seen, rock_hAngle, rock_dist]
+// food   = bright green (G dominant)
+// enemy  = red/pink (R dominant)
+// rock   = neutral gray (equal RGB, mid-brightness)
+// hAngle: -1 = far left, +1 = far right
+// dist:    1 = very close (bottom of frame), 0 = far (top of frame)
+function extractPerceptualFeatures(rgba: Uint8ClampedArray, res: number): Float32Array {
+	const sumX = [0, 0, 0];
+	const sumY = [0, 0, 0];
+	const cnt  = [0, 0, 0];
 
-function compactStateToFeatures(state: any): Float32Array {
-	const f = new Float32Array(STATE_FEATURE_COUNT);
-	f[0] = clamp(Number(state?.health ?? 0) / 100, 0, 1);
-	f[1] = clamp(Number(state?.energy ?? 0) / 140, 0, 1);
-	f[2] = clamp(Number(state?.organs ?? 0) / 4, 0, 1);
-	f[3] = clamp(Number(state?.botSpeed ?? 0) / 8, 0, 1);
-	f[4] = clamp(Number(state?.exitDist ?? 0) / WORLD_SIZE, 0, 1);
-	f[5] = clamp(Number(state?.exitForward ?? 0), -1, 1);
-	f[6] = clamp(Number(state?.exitRight ?? 0), -1, 1);
-	f[7] = clamp(Number(state?.nearestEnemyDist ?? WORLD_SIZE) / WORLD_SIZE, 0, 1);
-	f[8] = clamp(Number(state?.nearestEnemyForward ?? 0), -1, 1);
-	f[9] = clamp(Number(state?.nearestEnemyRight ?? 0), -1, 1);
-	f[10] = clamp(Number(state?.nearestRockDist ?? WORLD_SIZE) / WORLD_SIZE, 0, 1);
-	f[11] = clamp(Number(state?.nearestRockForward ?? 0), -1, 1);
-	f[12] = clamp(Number(state?.nearestRockRight ?? 0), -1, 1);
-	f[13] = state?.underThreat ? 1 : 0;
-	return f;
-}
-
-function visionToFeatures(rgba: Uint8ClampedArray, res: number): Float32Array {
-	const out = new Float32Array(VISION_FEATURE_COUNT);
-	for (let oy = 0; oy < VISION_FEATURE_DIM; oy += 1) {
-		for (let ox = 0; ox < VISION_FEATURE_DIM; ox += 1) {
-			const sx0 = Math.floor((ox * res) / VISION_FEATURE_DIM);
-			const sy0 = Math.floor((oy * res) / VISION_FEATURE_DIM);
-			const sx1 = Math.max(sx0 + 1, Math.floor(((ox + 1) * res) / VISION_FEATURE_DIM));
-			const sy1 = Math.max(sy0 + 1, Math.floor(((oy + 1) * res) / VISION_FEATURE_DIM));
-			let acc = 0;
-			let n = 0;
-			for (let y = sy0; y < sy1; y += 1) {
-				for (let x = sx0; x < sx1; x += 1) {
-					const idx = (y * res + x) * 4;
-					const r = rgba[idx];
-					const g = rgba[idx + 1];
-					const b = rgba[idx + 2];
-					acc += (0.2126 * r + 0.7152 * g + 0.0722 * b) / 255;
-					n += 1;
-				}
+	for (let y = 0; y < res; y += 1) {
+		for (let x = 0; x < res; x += 1) {
+			const idx = (y * res + x) * 4;
+			const r = rgba[idx];
+			const g = rgba[idx + 1];
+			const b = rgba[idx + 2];
+			// Food: green dominant, reasonably bright
+			if (g > 110 && g > r * 1.35 && g > b * 1.2) {
+				sumX[0] += x; sumY[0] += y; cnt[0] += 1;
+			// Enemy: red/pink dominant
+			} else if (r > 100 && r > g * 1.25 && r > b * 1.2) {
+				sumX[1] += x; sumY[1] += y; cnt[1] += 1;
+			// Rock: near-gray, not too dark
+			} else if (r > 70 && g > 70 && b > 70 &&
+					Math.abs(r - g) < 48 && Math.abs(r - b) < 48 && Math.abs(g - b) < 48) {
+				sumX[2] += x; sumY[2] += y; cnt[2] += 1;
 			}
-			out[oy * VISION_FEATURE_DIM + ox] = n > 0 ? acc / n : 0;
+		}
+	}
+
+	const out = new Float32Array(PERCEPT_FEATURE_COUNT);
+	for (let c = 0; c < 3; c += 1) {
+		const base = c * 3;
+		if (cnt[c] === 0) {
+			out[base]     = 0; // not seen
+			out[base + 1] = 0; // angle (center)
+			out[base + 2] = 0; // distance (far)
+		} else {
+			const cx = sumX[c] / cnt[c];
+			const cy = sumY[c] / cnt[c];
+			out[base]     = 1;                         // seen
+			out[base + 1] = (cx / res - 0.5) * 2;     // horizontal angle -1..1
+			out[base + 2] = cy / res;                  // dist: 1=bottom(close), 0=top(far)
 		}
 	}
 	return out;
 }
 
-function buildNetInput(vision: Float32Array, instr: Float32Array, stateFeat: Float32Array): Float32Array {
-	const input = new Float32Array(vision.length + instr.length + stateFeat.length);
-	input.set(vision, 0);
-	input.set(instr, vision.length);
-	input.set(stateFeat, vision.length + instr.length);
+function compactStateToFeatures(state: any): Float32Array {
+	const f = new Float32Array(STATE_FEATURE_COUNT); // 5 values
+	f[0] = clamp(Number(state?.health ?? 0) / 100, 0, 1);
+	f[1] = clamp(Number(state?.energy ?? 0) / 140, 0, 1);
+	f[2] = clamp(Number(state?.organs ?? 0) / 4, 0, 1);
+	f[3] = clamp(Number(state?.botSpeed ?? 0) / 8, 0, 1);
+	f[4] = state?.underThreat ? 1 : 0;
+	return f;
+}
+
+function visionToFeatures(_rgba: Uint8ClampedArray, _res: number): Float32Array {
+	return new Float32Array(PERCEPT_FEATURE_COUNT); // replaced by extractPerceptualFeatures
+}
+
+function buildNetInput(percept: Float32Array, stateFeat: Float32Array): Float32Array {
+	const input = new Float32Array(percept.length + stateFeat.length);
+	input.set(percept, 0);
+	input.set(stateFeat, percept.length);
 	return input;
 }
 
@@ -642,217 +659,8 @@ function sanitizeAction(action: Partial<AiAction> | null | undefined): AiAction 
 	};
 }
 
-function defaultFallbackAction(bot: Bot): AiAction {
-	// Simple fallback: move toward the exit.
-	const toExit = normalize(EXIT_X - bot.x, EXIT_Z - bot.z);
-	const heading = normalize(bot.headingX, bot.headingZ);
-	const right = { x: heading.z, z: -heading.x };
-	const forward = clamp(toExit.x * heading.x + toExit.z * heading.z, -1, 1);
-	const sideways = clamp(toExit.x * right.x + toExit.z * right.z, -1, 1);
-	return {
-		left: sideways < 0 ? Math.min(1, -sideways) : 0,
-		right: sideways > 0 ? Math.min(1, sideways) : 0,
-		forward: Math.max(0, forward),
-		backward: Math.max(0, -forward),
-		speed: 0.8,
-		pick: false,
-		throw: false,
-		grow: bot.energy < bot.maxEnergy * 0.25,
-	};
-}
-
-function ensureNonIdleAction(action: AiAction, bot: Bot, state?: any): AiAction {
-	const movementIntent = Math.abs(action.forward - action.backward) + Math.abs(action.right - action.left);
-
-	// If model sends speed with no directional intent, inject a safe directional fallback.
-	if (movementIntent <= 0.05) {
-		const fallback = defaultFallbackAction(bot);
-		return {
-			...fallback,
-			pick: action.pick,
-			throw: action.throw,
-			grow: action.grow,
-		};
-	}
-
-	let next: AiAction = { ...action };
-
-	// If exit is strongly to one side and model is only going forward, inject turn.
-	const turnIntent = Math.abs(next.right - next.left);
-	if (state && typeof state.exitRight === "number" && Math.abs(state.exitRight) > 0.25 && turnIntent < 0.12) {
-		if (state.exitRight > 0) {
-			next.right = Math.max(next.right, Math.min(1, Math.abs(state.exitRight)));
-			next.left = 0;
-		} else {
-			next.left = Math.max(next.left, Math.min(1, Math.abs(state.exitRight)));
-			next.right = 0;
-		}
-		next.forward = Math.max(next.forward, 0.45);
-		next.backward = 0;
-	}
-
-	// Penalize unnecessary pure rotation: if turning a lot with little forward progress and not under threat, push movement.
-	const pureTurn = Math.abs(next.right - next.left) > 0.45 && Math.abs(next.forward - next.backward) < 0.2;
-	const lowProgress = !state || typeof state.botSpeed !== "number" ? false : state.botSpeed < 0.28;
-	if (pureTurn && lowProgress && state?.underThreat !== true) {
-		next.forward = Math.max(next.forward, 0.62);
-		next.backward = 0;
-		next.speed = Math.max(next.speed, 0.68);
-	}
-
-	// If enemy is close (red object), run away from it.
-	if (
-		state &&
-		state.underThreat === true &&
-		typeof state.nearestEnemyDist === "number" &&
-		typeof state.nearestEnemyForward === "number" &&
-		typeof state.nearestEnemyRight === "number"
-	) {
-		const enemyVeryClose = state.nearestEnemyDist < 1.8;
-		const shouldForceEscapeDrive = enemyVeryClose || lowProgress;
-
-		if (state.nearestEnemyForward > 0) {
-			next.backward = Math.max(next.backward, shouldForceEscapeDrive ? 0.92 : 0.7);
-			next.forward = 0;
-		} else {
-			next.forward = Math.max(next.forward, shouldForceEscapeDrive ? 0.92 : 0.7);
-			next.backward = 0;
-		}
-
-		if (state.nearestEnemyRight > 0) {
-			next.left = Math.max(next.left, shouldForceEscapeDrive ? 0.28 : 0.65);
-			next.right = 0;
-		} else {
-			next.right = Math.max(next.right, shouldForceEscapeDrive ? 0.28 : 0.65);
-			next.left = 0;
-		}
-
-		// When stuck/very close to enemy, prioritize translation over rotation.
-		if (shouldForceEscapeDrive) {
-			if (next.left > 0) next.left = Math.min(next.left, 0.35);
-			if (next.right > 0) next.right = Math.min(next.right, 0.35);
-		}
-
-		next.speed = Math.max(next.speed, shouldForceEscapeDrive ? 0.95 : 0.8);
-	}
-
-	// Direction exists but speed may be too low; nudge it so movement continues.
-	if (next.speed < 0.35) {
-		return {
-			...next,
-			speed: 0.55,
-		};
-	}
-
-	return next;
-}
-
-async function callLocalAi(lmStudioBaseUrl: string, model: string, compactState: any, visionDataUrl?: string | null): Promise<AiAction> {
-	const modelKey = model.trim();
-	if (!modelKey) throw new Error("Missing model key");
-
-	const systemPrompt =
-		"Return ONLY one minified JSON object. No reasoning. No prose. No markdown.\n" +
-		"Do NOT output ``` or ```json fences. Do NOT output backticks.\n" +
-		"Output must start with { and end with }.\n" +
-		"Keys: left,right,forward,backward in [-1..1], speed in [0..1], booleans pick,throw,grow,seesGreenCheckpoint,seesStone,seesRedEnemy.\n" +
-		"Actions: pick picks nearest rock if close and hands free; throw throws held rock forward; grow increases capacity if enough energy.\n" +
-		"Optimization objective: reach the green checkpoint as FAST as possible (maximize speed to goal).\n" +
-		"Penalty rule: unnecessary spinning/rotation without progress is BAD and should be avoided.\n" +
-		"Reward rule: sustained movement toward green checkpoint is GOOD.\n" +
-		"Vision rule: RED object means enemy, immediately run away from it.\n" +
-		"Vision rule: GRAY/WHITE object means stone, move to it and pick it when close.\n" +
-		"Primary goal: find the GREEN EXIT RING in the visual image and move toward it continuously.\n" +
-		"Exploration rule: do not drive straight forever; frequently turn left/right to scan surroundings when target is unclear.\n" +
-		"In EVERY response, set seesGreenCheckpoint/seesStone/seesRedEnemy true or false based on current vision.\n" +
-		"Use both image and state: exitForward and exitRight are direction-to-exit in bot-local coordinates.\n" +
-		"Steering policy: if exitForward > 0.15 set forward >= 0.7 and backward = 0; if exitForward < -0.15 set backward >= 0.45.\n" +
-		"Steering policy: if exitRight > 0.15 set right >= 0.55 and left = 0; if exitRight < -0.15 set left >= 0.55 and right = 0.\n" +
-		"If green ring is visible in image, prioritize centering it then move forward quickly.\n" +
-		"If green ring is NOT visible, keep exploring: speed >= 0.55 and use turn (left or right) plus some forward.\n" +
-		"Never output all movement axes as zero. Never output speed > 0 with zero movement axes.\n" +
-		"Avoid repeating the exact same action many ticks in a row; adapt using latest image and state.\n" +
-		"Example: {\"left\":0,\"right\":0.3,\"forward\":0.9,\"backward\":0,\"speed\":0.85,\"pick\":false,\"throw\":false,\"grow\":false,\"seesGreenCheckpoint\":true,\"seesStone\":false,\"seesRedEnemy\":false}";
-
-	const userText = JSON.stringify(compactState);
-	const safeVision = visionDataUrl && visionDataUrl.length > 0 ? visionDataUrl : null;
-
-	// Prefer tool-calling via OpenAI-compatible /v1/responses to guarantee structured JSON args.
-	const tool = {
-		type: "function" as const,
-		name: "act",
-		description: "Choose the next movement/action for the bot.",
-		parameters: {
-			type: "object",
-			additionalProperties: false,
-			properties: {
-				left: { type: "number" },
-				right: { type: "number" },
-				forward: { type: "number" },
-				backward: { type: "number" },
-				speed: { type: "number" },
-				pick: { type: "boolean" },
-				throw: { type: "boolean" },
-				grow: { type: "boolean" },
-				seesGreenCheckpoint: { type: "boolean" },
-				seesStone: { type: "boolean" },
-				seesRedEnemy: { type: "boolean" },
-			},
-			required: ["left", "right", "forward", "backward", "speed"],
-		},
-	};
-
-	try {
-		const toolCall = await lmStudioResponsesToolCall({
-			lmStudioBaseUrl,
-			model: modelKey,
-			systemPrompt,
-			userText,
-			visionDataUrl: safeVision,
-			tools: [tool],
-			toolChoice: { type: "function", name: "act" },
-			maxOutputTokens: 90,
-			temperature: 0,
-		});
-		if (toolCall?.name === "act") {
-			let args: any = toolCall.args;
-			if (typeof args === "string") {
-				try {
-					args = JSON.parse(args);
-				} catch {
-					// keep as-is
-				}
-			}
-			return sanitizeAction(args);
-		}
-	} catch {
-		// fall through to text-based fallback
-	}
-
-	// Fallback: ask for raw JSON in text.
-	const content = await lmStudioChatText({
-		lmStudioBaseUrl,
-		model: modelKey,
-		systemPrompt,
-		userText,
-		visionDataUrl: safeVision,
-		maxOutputTokens: 90,
-		temperature: 0,
-	});
-	let actionObj: any = null;
-	try {
-		actionObj = extractJsonFromText(String(content));
-	} catch {
-		actionObj = null;
-	}
-	if (!actionObj) throw new Error("Failed to parse AI action from response");
-	return sanitizeAction(actionObj);
-}
-
-async function callReplicateLike(apiToken: string, model: string, payload: any): Promise<AiAction> {
-	const json = await replicatePredict(apiToken, model, payload);
-	const output = json?.output ?? json;
-	return sanitizeAction(output);
+function defaultFallbackAction(): AiAction {
+	return { left: 0, right: 0, forward: 1, backward: 0, speed: 0.6, pick: false, throw: false, grow: false };
 }
 
 function BabylonWorld({
@@ -964,21 +772,7 @@ function BabylonWorld({
 		wallE.isPickable = false;
 		wallE.material = wallMat;
 
-		// Exit marker (GTA-style checkpoint: hollow transparent green cylinder)
-		const checkpointHeight = 4.2;
-		const exit = BABYLON.MeshBuilder.CreateCylinder(
-			"exit",
-			{ diameter: EXIT_RADIUS * 2.4, height: checkpointHeight, tessellation: 56, cap: BABYLON.Mesh.NO_CAP },
-			scene,
-		);
-		exit.position.set(EXIT_X, checkpointHeight * 0.5, EXIT_Z);
-		exit.isPickable = false;
-		const exitMat = new BABYLON.StandardMaterial("exitMat", scene);
-		exitMat.emissiveColor = BABYLON.Color3.FromHexString("#eab308");
-		exitMat.diffuseColor = BABYLON.Color3.FromHexString("#facc15");
-		exitMat.alpha = 0.3; // 70% transparent
-		exitMat.backFaceCulling = false; // visible from inside and outside
-		exit.material = exitMat;
+		// Exit marker removed — survival sim has no goal location
 
 		// Procedural city obstacles (buildings as boxes + collision circles)
 		const obstacles: Obstacle[] = [];
@@ -1060,7 +854,7 @@ function BabylonWorld({
 				id: randomId("bot"),
 				bot,
 				mesh,
-				action: defaultFallbackAction(bot),
+				action: defaultFallbackAction(),
 				fitness: 0,
 				prevExitDist: Number.POSITIVE_INFINITY,
 				prevHeadingX: bot.headingX,
@@ -1069,6 +863,7 @@ function BabylonWorld({
 				directionChanges: 0,
 				deathPenaltyApplied: false,
 				heldRockId: null,
+				exploredCells: new Set<number>(),
 			});
 		}
 
@@ -1103,6 +898,13 @@ function BabylonWorld({
 		const rockMeshes = new Map<string, BABYLON.Mesh>();
 		const rockMat = new BABYLON.StandardMaterial("rockMat", scene);
 		rockMat.diffuseColor = BABYLON.Color3.FromHexString("#94a3b8");
+
+		// ── Food particles ──────────────────────────────────────────
+		const foods: Food[] = [];
+		const foodMeshes = new Map<string, BABYLON.Mesh>();
+		const foodMat = new BABYLON.StandardMaterial("foodMat", scene);
+		foodMat.diffuseColor = BABYLON.Color3.FromHexString("#4ade80");
+		foodMat.emissiveColor = BABYLON.Color3.FromHexString("#16a34a");
 
 		// Selection ring: flat torus on the ground around the selected bot (5-unit radius)
 		const selectionRing = BABYLON.MeshBuilder.CreateTorus("selectionRing", { diameter: 10, thickness: 0.18, tessellation: 48 }, scene);
@@ -1162,6 +964,25 @@ function BabylonWorld({
 				mesh.setEnabled(e.alive);
 				if (e.alive) mesh.position.set(e.x, ENEMY_RADIUS, e.z);
 			}
+		};
+
+		const syncFoods = () => {
+			for (const f of foods) {
+				let mesh = foodMeshes.get(f.id);
+				if (!mesh) {
+					mesh = BABYLON.MeshBuilder.CreateSphere(`food-${f.id}`, { diameter: FOOD_RADIUS * 2, segments: 6 }, scene);
+					mesh.material = foodMat;
+					mesh.isPickable = false;
+					foodMeshes.set(f.id, mesh);
+				}
+				mesh.setEnabled(f.active);
+				if (f.active) mesh.position.set(f.x, FOOD_RADIUS, f.z);
+			}
+		};
+
+		const spawnFood = () => {
+			const id = randomId("food");
+			foods.push({ id, x: rand(-HALF + 5, HALF - 5), z: rand(-HALF + 5, HALF - 5), active: true });
 		};
 
 		const spawnEnemyAt = (x: number, z: number) => {
@@ -1251,12 +1072,13 @@ function BabylonWorld({
 		window.addEventListener("keydown", keySpawnHandler);
 
 		// Vision rendering should include relevant meshes
-		visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, exit, ...Array.from(buildingMeshes.values()), ...botAgents.map((a) => a.mesh)];
-		// Enemies/rocks are added dynamically via sync functions; we will refresh renderList periodically.
+		visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, ...Array.from(buildingMeshes.values()), ...botAgents.map((a) => a.mesh)];
+		// Enemies/rocks/food are added dynamically via sync functions; we will refresh renderList periodically.
 		let lastRenderListRefresh = 0;
 
 		let lastAiAt = 0;
 		let pendingAi = false;
+		let foodSpawnAccum = 0;
 
 		const captureVision = async (viewer: Bot, res: number) => {
 			// Ensure target size matches settings.
@@ -1268,7 +1090,7 @@ function BabylonWorld({
 			eyeCam.setTarget(new BABYLON.Vector3(viewer.x + viewer.headingX, eyeY, viewer.z + viewer.headingZ));
 			visionTarget.render(true);
 			const pixels = (await visionTarget.readPixels()) as Uint8Array | null;
-			if (!pixels) return { dataUrl: "", features: new Float32Array(VISION_FEATURE_COUNT) };
+			if (!pixels) return { dataUrl: "", features: new Float32Array(PERCEPT_FEATURE_COUNT) };
 
 			// pixels are Uint8Array RGBA. Create a vertically flipped copy for display + matrix.
 			const flipped = new Uint8ClampedArray(res * res * 4);
@@ -1283,22 +1105,16 @@ function BabylonWorld({
 			offscreen.width = res;
 			offscreen.height = res;
 			const ctx = offscreen.getContext("2d", { willReadFrequently: true });
-			if (!ctx) return { dataUrl: "", features: visionToFeatures(flipped, res) };
+			if (!ctx) return { dataUrl: "", features: extractPerceptualFeatures(flipped, res) };
 			const img = new ImageData(flipped, res, res);
 			ctx.putImageData(img, 0, 0);
 			const dataUrl = offscreen.toDataURL("image/png");
-			const features = visionToFeatures(flipped, res);
+			const features = extractPerceptualFeatures(flipped, res);
 			return { dataUrl, features };
 		};
 
 		const computeCompactState = (viewer: Bot) => {
 			const basis = computeBotHeadingBasis(viewer);
-			const toExitX = EXIT_X - viewer.x;
-			const toExitZ = EXIT_Z - viewer.z;
-			const exitDist = Math.sqrt(toExitX * toExitX + toExitZ * toExitZ);
-			const toExitDir = normalize(toExitX, toExitZ);
-			const exitForward = toExitDir.x * basis.h.x + toExitDir.z * basis.h.z;
-			const exitRight = toExitDir.x * basis.r.x + toExitDir.z * basis.r.z;
 
 			let nearestEnemyDist = Infinity;
 			let nearestEnemyForward = 0;
@@ -1341,9 +1157,6 @@ function BabylonWorld({
 				energy: round3(viewer.energy),
 				organs: viewer.organs,
 				botSpeed: round3(botSpeed),
-				exitDist: round3(exitDist),
-				exitForward: round3(exitForward),
-				exitRight: round3(exitRight),
 				nearestEnemyDist: Number.isFinite(nearestEnemyDist) ? round3(nearestEnemyDist) : null,
 				nearestEnemyForward: Number.isFinite(nearestEnemyDist) ? round3(nearestEnemyForward) : null,
 				nearestEnemyRight: Number.isFinite(nearestEnemyDist) ? round3(nearestEnemyRight) : null,
@@ -1393,7 +1206,7 @@ function BabylonWorld({
 				b.maxEnergy = 120;
 				b.organs = 0;
 				b.escaped = false;
-				a.action = defaultFallbackAction(b);
+				a.action = defaultFallbackAction();
 				a.fitness = 0;
 				a.prevExitDist = Number.POSITIVE_INFINITY;
 				a.prevHeadingX = b.headingX;
@@ -1407,11 +1220,16 @@ function BabylonWorld({
 					if (hr) hr.heldByBot = false;
 					a.heldRockId = null;
 				}
+				a.exploredCells.clear();
 			}
 			enemies.length = 0;
 			for (const e of enemyMeshes.values()) e.dispose();
 			enemyMeshes.clear();
 			spawnBaselineEnemies();
+			// Clear food so each generation starts clean
+			foods.length = 0;
+			for (const m of foodMeshes.values()) m.dispose();
+			foodMeshes.clear();
 			for (const r of rocks) {
 				r.x = rand(-HALF + 10, HALF - 10);
 				r.z = rand(-HALF + 10, HALF - 10);
@@ -1432,9 +1250,7 @@ function BabylonWorld({
 		let lastUiAt = 0;
 		let lastT = performance.now();
 		let lastAiSentImage = false;
-		const instructionText = "Reach green checkpoint as fast as possible, avoid red enemies, collect gray/white stones when safe, and explore by turning left/right.";
-		const instructionFeatures = instructionToFeatures(instructionText);
-		const inputSize = VISION_FEATURE_COUNT + INSTRUCTION_FEATURE_COUNT + STATE_FEATURE_COUNT;
+		const inputSize = PERCEPT_FEATURE_COUNT + STATE_FEATURE_COUNT; // 9 percept + 5 state = 14
 		let population = createPopulation(BOT_COUNT, inputSize);
 		let generation = 1;
 		let evalStartAt = performance.now();
@@ -1562,11 +1378,17 @@ function BabylonWorld({
 			// Refresh vision render list occasionally.
 			if (now - lastRenderListRefresh > 800) {
 				lastRenderListRefresh = now;
-				visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, exit, ...Array.from(buildingMeshes.values()), ...botAgents.map((a) => a.mesh), ...Array.from(enemyMeshes.values()), ...Array.from(rockMeshes.values())];
+				visionTarget.renderList = [ground, wallN, wallS, wallW, wallE, ...Array.from(buildingMeshes.values()), ...botAgents.map((a) => a.mesh), ...Array.from(enemyMeshes.values()), ...Array.from(rockMeshes.values()), ...Array.from(foodMeshes.values())];
 			}
 
 			const s = settingsRef.current;
 			if (!pausedRef.current) {
+				// Spawn food continuously at FOOD_SPAWN_PER_SEC per second
+				foodSpawnAccum += dt * FOOD_SPAWN_PER_SEC;
+				const foodToSpawn = Math.floor(foodSpawnAccum);
+				foodSpawnAccum -= foodToSpawn;
+				for (let fi = 0; fi < foodToSpawn; fi += 1) spawnFood();
+
 				// AI tick
 				const aiPeriodMs = 1000 / Math.max(0.2, s.aiHz);
 				if (!pendingAi && now - lastAiAt >= aiPeriodMs) {
@@ -1585,19 +1407,16 @@ function BabylonWorld({
 								const cap = await captureVision(viewer, tickRes);
 								if (i === selectedBotIdx && cap?.dataUrl) onVisionPreviewRef.current(cap.dataUrl);
 								const compactState = computeCompactState(viewer);
-								if (i === selectedBotIdx) asked = JSON.stringify({ instruction: instructionText, state: compactState });
+								if (i === selectedBotIdx) asked = JSON.stringify({ state: compactState });
 
 								const genome = population[i];
-								const visionFeatures = cap?.features ?? new Float32Array(VISION_FEATURE_COUNT);
+								const perceptFeatures = cap?.features ?? new Float32Array(PERCEPT_FEATURE_COUNT);
 								const stateFeatures = compactStateToFeatures(compactState);
-								const netInput = buildNetInput(visionFeatures, instructionFeatures, stateFeatures);
+								const netInput = buildNetInput(perceptFeatures, stateFeatures);
 								const trace = forwardDenseNetTrace(genome.net, netInput);
 								traces.set(i, { netInput, trace });
 
-								let action = outputsToAction(trace.out);
-								if (generation <= GUIDED_GENERATION_LIMIT) {
-									action = ensureNonIdleAction(action, viewer, compactState);
-								}
+const action = outputsToAction(trace.out);
 								agent.action = action;
 
 								// --- Fitness: reward survival time + enemy kills ---
@@ -1619,7 +1438,6 @@ function BabylonWorld({
 									agent.fitness = computeFitness(agent.fitness, { idle: true, underThreat: false });
 								}
 
-								agent.prevExitDist = compactState.exitDist;
 								agent.prevHeadingX = viewer.headingX;
 								agent.prevHeadingZ = viewer.headingZ;
 								genome.fitness = agent.fitness;
@@ -1667,7 +1485,7 @@ function BabylonWorld({
 							emitSelectedBotSnapshot();
 
 							const evalSeconds = (performance.now() - evalStartAt) / 1000;
-							const allTerminal = botAgents.every((a) => a.bot.health <= 0 || a.bot.escaped);
+							const allTerminal = botAgents.every((a) => a.bot.health <= 0);
 							const shouldAdvance = allTerminal || evalSeconds > Math.max(5, s.generationSeconds);
 							if (shouldAdvance) {
 								for (let i = 0; i < botAgents.length; i += 1) population[i].fitness = botAgents[i].fitness;
@@ -1700,7 +1518,7 @@ function BabylonWorld({
 								at: Date.now(),
 							});
 						} catch (err: any) {
-							for (const a of botAgents) a.action = defaultFallbackAction(a.bot);
+							for (const a of botAgents) a.action = defaultFallbackAction();
 							onAiExchangeRef.current({
 								id: randomId("ai"),
 								provider: s.aiProvider,
@@ -1794,7 +1612,29 @@ function BabylonWorld({
 							bot.headingZ = vz / vmag;
 						}
 
+						// Exploration: reward entering a new map cell (8-unit grid)
+						const ecx = Math.floor((bot.x + HALF) / 8);
+						const ecz = Math.floor((bot.z + HALF) / 8);
+						const cellKey = ecx * 20 + ecz;
+						if (!agent.exploredCells.has(cellKey)) {
+							agent.exploredCells.add(cellKey);
+							agent.fitness = computeFitness(agent.fitness, { explorationDelta: 1 });
+							population[i].fitness = agent.fitness;
+						}
+
 						bot.energy = clamp(bot.energy - s.energyDrainPerSec * (0.15 + vmag * 0.45) * dt, 0, bot.maxEnergy);
+
+						// Eat food: +FOOD_ENERGY_GAIN energy per food particle touched
+						const eatRadiusSq = (BOT_RADIUS + FOOD_RADIUS) ** 2;
+						for (const f of foods) {
+							if (!f.active) continue;
+							if (dist2({ x: bot.x, z: bot.z }, { x: f.x, z: f.z }) < eatRadiusSq) {
+								f.active = false;
+								bot.energy = clamp(bot.energy + FOOD_ENERGY_GAIN, 0, bot.maxEnergy);
+								agent.fitness = computeFitness(agent.fitness, { ateFood: true });
+								population[i].fitness = agent.fitness;
+							}
+						}
 						if (bot.energy <= 0) bot.health = clamp(bot.health - 10 * dt, 0, bot.maxHealth);
 						if (bot.health <= 0 && !agent.deathPenaltyApplied) {
 							agent.deathPenaltyApplied = true;
@@ -1854,12 +1694,6 @@ function BabylonWorld({
 								}
 								agent.heldRockId = null;
 							}
-						}
-
-						if (dist2({ x: bot.x, z: bot.z }, { x: EXIT_X, z: EXIT_Z }) < EXIT_RADIUS * EXIT_RADIUS) {
-							bot.escaped = true;
-							agent.fitness = computeFitness(agent.fitness, { reachedCheckpoint: true, underThreat: false });
-							population[i].fitness = agent.fitness;
 						}
 					}
 
@@ -1984,7 +1818,7 @@ function BabylonWorld({
 
 			// Update selection ring to follow selected bot
 			const selBot = botAgents[selectedBotIdx];
-			if (selBot && selBot.bot.health > 0 && !selBot.bot.escaped) {
+			if (selBot && selBot.bot.health > 0) {
 				selectionRing.setEnabled(true);
 				selectionRing.position.set(selBot.bot.x, 0.08, selBot.bot.z);
 			} else {
@@ -1993,6 +1827,7 @@ function BabylonWorld({
 
 			syncEnemies();
 			syncRocks();
+			syncFoods();
 
 			// UI snapshot
 			if (now - lastUiAt > 160) {
@@ -2003,17 +1838,15 @@ function BabylonWorld({
 				const bestBot = bestAgent?.bot;
 				const localHint = settingsRef.current.aiProvider === "local" && !localBootstrap.ready ? ` (${localBootstrap.status})` : "";
 				const imgHint = settingsRef.current.aiProvider === "local" ? (lastAiSentImage ? " [img]" : " [no-img]") : "";
-				const status = bestBot?.escaped
-					? `Escaped! G${generation}`
-					: (bestBot?.health ?? 0) <= 0
-						? `Dead G${generation}`
-						: pausedRef.current
-							? "Paused"
-							: pendingAi
-								? "Waiting for AI..."
+				const status = (bestBot?.health ?? 0) <= 0
+					? `All dead G${generation}`
+					: pausedRef.current
+						? "Paused"
+						: pendingAi
+							? "Waiting for AI..."
 							: settingsRef.current.aiProvider === "none"
 								? "No AI configured (fallback running)"
-									: `Running G${generation} · 10 bots · top 3 evolve${localHint}${imgHint}`;
+								: `Running G${generation} · 10 bots · survive & explore${localHint}${imgHint}`;
 
 				onUi({
 					health: bestBot?.health ?? 0,
@@ -2021,7 +1854,7 @@ function BabylonWorld({
 					enemiesAlive: aliveEnemies,
 					rocksActive: activeRocks,
 					organs: bestBot?.organs ?? 0,
-					escaped: bestBot?.escaped ?? false,
+					escaped: false,
 					dead: (bestBot?.health ?? 0) <= 0,
 					status,
 				});

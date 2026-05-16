@@ -33,7 +33,7 @@ import pybullet_data
 # ──────────────────────────────────────────────────────────
 
 POP_SIZE   = 20
-SIM_TIME   = 8.0
+SIM_TIME   = 15.0
 PHYS_DT    = 1.0 / 240.0
 GRAVITY    = 9.81
 

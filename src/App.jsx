@@ -5,6 +5,7 @@ import NeuralVisionSim3D from './simulations/sim3/sim3.tsx'
 import MazeNeuralVisionSim3D from './simulations/sim4/sim4.tsx'
 import CityEscapeSim3D from './simulations/sim15/sim15.tsx'
 import CityEscapeGeneticSim3D from './simulations/sim6/sim6.tsx'
+import Sim7HumanWalk from './simulations/sim7/sim7.tsx'
 import SplatWebSim3D from './simulations/splatsWeb/splatsWeb.tsx'
 import './App.css'
 
@@ -57,6 +58,13 @@ const simulations = [
     description: 'Structured facial topology splat renderer (WebGL) with separate face/body shading and readable motion silhouette.',
     status: 'New',
 		docsPath: '/docs/sim4-survival.md',
+  },
+  {
+    id: 'human-walk-ga-3d',
+    title: 'Human Walk GA',
+    description: 'A human-like articulated figure evolves gait parameters with a genetic algorithm to learn stable forward walking.',
+    status: 'New',
+		docsPath: '/docs/sim7-human-walk-ga.md',
   },
 ]
 
@@ -120,6 +128,7 @@ function SimulationView() {
   if (simulationId === 'maze-neural-vision-ga-3d') simulation = <MazeNeuralVisionSim3D />
   if (simulationId === 'city-escape-ai-3d') simulation = <CityEscapeSim3D />
   if (simulationId === 'city-escape-genetic-3d') simulation = <CityEscapeGeneticSim3D />
+  if (simulationId === 'human-walk-ga-3d') simulation = <Sim7HumanWalk />
   if (simulationId === 'splats-webgl-face') simulation = <SplatWebSim3D />
 
   const validIds = new Set(simulations.map((s) => s.id))
