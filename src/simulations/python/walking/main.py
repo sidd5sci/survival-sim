@@ -10,6 +10,9 @@ Main fixes compared with the earlier version:
   - Reward only pays meaningful forward progress while grounded/upright.
   - Fitness penalizes flying/flipping exploits.
   - Contact tracking, airtime, and target smoothing were added.
+  - In-world HUD/debug labels were removed for speed.
+  - Lightweight status is shown in PyBullet's right-side debug panel.
+  - GUI keyboard/camera controls keep working in idle/hold mode after finite runs.
 """
 
 from __future__ import annotations
@@ -68,6 +71,8 @@ MAX_AIR_TIME = 0.45
 
 GUI_FAST       = True
 GUI_SPEED      = 24.0
+STATUS_INTERVAL = 1.00  # terminal-only status throttle; no PyBullet UI updates
+POST_GEN_IDLE  = 0.0    # set >0.0 if you want a visible pause between generations
 INIT_YAW       = 40.0
 INIT_PITCH     = -20.0
 INIT_DIST      = 11.0
@@ -568,6 +573,8 @@ class Sim:
                          physicsClientId=self.client)
 
         if gui:
+            # Fast viewport-only mode. The PyBullet sidebar/debug UI is disabled
+            # because debug sliders/text are expensive and slow rendering.
             for flag in (p.COV_ENABLE_GUI,
                          p.COV_ENABLE_SHADOWS,
                          p.COV_ENABLE_SEGMENTATION_MARK_PREVIEW,
@@ -594,12 +601,8 @@ class Sim:
         self._sel    = 0
         self._follow = FOLLOW_DEFAULT
 
-        self._id_status   = -1
-        self._id_controls = -1
-        self._id_path     = -1
-        self._id_goal     = -1
-        self._id_pole_s   = -1
-        self._id_pole_d   = -1
+        # No debug text, debug lines, or sidebar sliders. Terminal-only status.
+        self._last_status_print = 0.0
 
         self._spawn()
         if load:
@@ -723,41 +726,27 @@ class Sim:
 
         self._cam_yaw, self._cam_pitch, self._cam_dist = live_yaw, live_pitch, live_dist
 
-    def _draw_hud(self, t: float) -> None:
-        w   = self.walkers[self._sel]
-        pos, _ = p.getBasePositionAndOrientation(w.body, physicsClientId=self.client)
-        alive  = sum(1 for ww in self.walkers if ww.alive)
-        best   = max(ww.fit for ww in self.walkers)
-
-        status = (f"Gen {self.ga.gen} | t={t:.1f}s | alive={alive}/{POP_SIZE} | "
-                  f"best={best:.2f}m | sel={self._sel} x={float(pos[0]):.2f}m | "
-                  f"air={w.air_time:.2f}s | follow={'ON' if self._follow else 'off'}")
-        ctrl   = ("Mouse drag=rotate Shift+drag=translate Scroll=zoom "
-                  "Arrows=rotate Q=zoom out E=zoom in A/D=select F=follow")
-
-        def _txt(text, position, color, size, old_id):
-            if old_id >= 0:
-                p.removeUserDebugItem(old_id, physicsClientId=self.client)
-            return p.addUserDebugText(text, position, textColorRGB=color,
-                                      textSize=size, lifeTime=0.4,
-                                      physicsClientId=self.client)
-
-        def _line(a, b, color, width, old_id):
-            kw = dict(lineColorRGB=color, lineWidth=width, lifeTime=0.4,
-                      physicsClientId=self.client)
-            if old_id >= 0:
-                kw["replaceItemUniqueId"] = old_id
-            return p.addUserDebugLine(a, b, **kw)
-
-        self._id_status   = _txt(status, [0.0, 0.0, 2.10], [0.95,0.95,0.95], 1.3,  self._id_status)
-        self._id_controls = _txt(ctrl,   [0.0, 0.0, 2.45], [0.70,0.90,1.00], 1.05, self._id_controls)
-
-        sx, sy = w.start_pos[0], w.start_pos[1]
-        cx, cy = float(pos[0]),  float(pos[1])
-        self._id_path   = _line([sx, sy, 0.02], [cx, cy, 0.02],     [0.30,0.90,0.40], 3.0, self._id_path)
-        self._id_goal   = _line([sx, sy, 0.02], [DEST_X, sy, 0.02], [0.95,0.70,0.20], 2.0, self._id_goal)
-        self._id_pole_s = _line([sx,     sy, 0.01], [sx,     sy, 0.40], [0.20,0.75,1.00], 2.0, self._id_pole_s)
-        self._id_pole_d = _line([DEST_X, sy, 0.01], [DEST_X, sy, 0.40], [1.00,0.35,0.35], 2.0, self._id_pole_d)
+    def _print_status(self, t: float, force: bool = False) -> None:
+        """Cheap terminal status only. No PyBullet debug items are created."""
+        if not force:
+            now = time.time()
+            if now - self._last_status_print < STATUS_INTERVAL:
+                return
+            self._last_status_print = now
+        alive = sum(1 for ww in self.walkers if ww.alive)
+        live_best_x = max((ww.last_x for ww in self.walkers), default=0.0)
+        sel_x = 0.0
+        if self.walkers:
+            pos, _ = p.getBasePositionAndOrientation(self.walkers[self._sel].body,
+                                                     physicsClientId=self.client)
+            sel_x = float(pos[0])
+        print(
+            f"\rGen {self.ga.gen} | t={t:4.1f}s | alive={alive:2d}/{POP_SIZE} | "
+            f"sel={self._sel:02d} x={sel_x:6.2f}m | live_best_x={live_best_x:6.2f}m | "
+            f"all_time={self.ga.best_fit:6.2f}m",
+            end='',
+            flush=True,
+        )
 
     def run_generation(self) -> None:
         total = int(SIM_TIME / PHYS_DT)
@@ -777,11 +766,11 @@ class Sim:
             for w in self.walkers:
                 w.check_alive(t)
 
-            if self.gui and step % 120 == 0:
+            if self.gui and step % max(1, int(STATUS_INTERVAL / PHYS_DT)) == 0:
                 if self._follow:
                     self._sel = self._best_alive_idx()
                     self._refresh_highlights()
-                self._draw_hud(t)
+                self._print_status(t)
 
             if not GUI_FAST and self.gui:
                 time.sleep(PHYS_DT / max(1.0, GUI_SPEED))
@@ -792,9 +781,32 @@ class Sim:
         for i, w in enumerate(self.walkers):
             self.ga.record(i, w.final_fitness())
 
+        if self.gui:
+            self._print_status(t, force=True)
+            print()
+            if POST_GEN_IDLE > 0.0:
+                self.idle_gui(POST_GEN_IDLE, t)
+
         self.ga.evolve()
         self._save_checkpoint()
         self._spawn()
+
+    def idle_gui(self, seconds: float | None = None, t: float = 0.0) -> None:
+        """Keep the PyBullet GUI responsive when physics is not advancing.
+
+        PyBullet keyboard events only update when the app keeps polling them.
+        This lets arrow/Q/E/A/D/F camera and selection controls work after a
+        finite `--gens` run, or during an optional between-generation pause.
+
+        Press Ctrl+C in the terminal to exit.
+        """
+        if not self.gui:
+            return
+        start = time.time()
+        while seconds is None or (time.time() - start) < seconds:
+            self._poll_keys()
+            self._update_camera()
+            time.sleep(1.0 / 60.0)
 
     def close(self) -> None:
         if self.client >= 0:
@@ -802,14 +814,14 @@ class Sim:
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Genetic Walker — PyBullet stability-fixed")
+    ap = argparse.ArgumentParser(description="Genetic Walker — PyBullet fast viewport")
     ap.add_argument("--direct",  action="store_true", help="Run headless (no GUI)")
     ap.add_argument("--gens",    type=int, default=0,  help="Generations to run (0=infinite)")
     ap.add_argument("--no-load", action="store_true",  help="Ignore checkpoint, start fresh")
     args = ap.parse_args()
 
     sim = Sim(gui=not args.direct, load=not args.no_load)
-    print("Genetic Walker — PyBullet stability-fixed")
+    print("Genetic Walker — PyBullet fast viewport")
     print(f"Pop={POP_SIZE} NN={N_IN}->{N_H1}->{N_H2}->{N_OUT} weights={N_W}")
     if args.direct:
         print("Mode: DIRECT/headless")
@@ -821,6 +833,14 @@ def main() -> None:
         while args.gens == 0 or gen < args.gens:
             sim.run_generation()
             gen += 1
+
+        # If the user asked for a finite number of GUI generations, keep the
+        # window alive and keep polling keyboard/camera controls instead of
+        # immediately disconnecting. This fixes controls only working while the
+        # simulation loop is actively running.
+        if not args.direct and args.gens > 0:
+            print("Finished requested generations. GUI is in idle mode; press Ctrl+C in terminal to exit.")
+            sim.idle_gui(None, 0.0)
     except KeyboardInterrupt:
         pass
     finally:
