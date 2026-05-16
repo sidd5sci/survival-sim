@@ -89,6 +89,50 @@ type ViewerBundle = {
   cleanupUrls: string[];
 };
 
+type SuperSplatBoneOverlay = {
+  bones: Array<{
+    id: number;
+    parentId: number;
+    name: string;
+    position: [number, number, number];
+  }>;
+};
+
+function flipPlyForAnalysis(data: GaussianSplatData): GaussianSplatData {
+  const positions = new Float32Array(data.positions.length);
+  const quaternions = new Float32Array(data.quaternions.length);
+
+  for (let i = 0; i < data.count; i += 1) {
+    const basePos = i * 3;
+    positions[basePos] = data.positions[basePos];
+    positions[basePos + 1] = -data.positions[basePos + 1];
+    positions[basePos + 2] = -data.positions[basePos + 2];
+
+    const baseQuat = i * 4;
+    // Apply a 180-degree X rotation in world space for analysis-only orientation correction.
+    const out = quatMultiply(
+      1,
+      0,
+      0,
+      0,
+      data.quaternions[baseQuat],
+      data.quaternions[baseQuat + 1],
+      data.quaternions[baseQuat + 2],
+      data.quaternions[baseQuat + 3],
+    );
+    quaternions[baseQuat] = out[0];
+    quaternions[baseQuat + 1] = out[1];
+    quaternions[baseQuat + 2] = out[2];
+    quaternions[baseQuat + 3] = out[3];
+  }
+
+  return {
+    ...data,
+    positions,
+    quaternions,
+  };
+}
+
 type ManualBoneEdit = {
   tx: number;
   ty: number;
@@ -141,7 +185,21 @@ function buildDefaultViewerSettingsJson() {
   };
 }
 
-function buildSuperSplatViewerBundle(arrayBuffer: ArrayBuffer): ViewerBundle {
+function buildSuperSplatBoneOverlay(canonical: CanonicalAvatar, rig: SkeletonRig): SuperSplatBoneOverlay {
+  const bones = rig.bones.map((bone) => {
+    const p = bone.worldPosePosition ?? bone.worldBindPosition;
+    const world = canonicalToWorldPosition(canonical, p[0], p[1], p[2]);
+    return {
+      id: bone.id,
+      parentId: bone.parentId,
+      name: bone.name,
+      position: [world.x, world.y, world.z] as [number, number, number],
+    };
+  });
+  return { bones };
+}
+
+function buildSuperSplatViewerBundle(arrayBuffer: ArrayBuffer, boneOverlay: SuperSplatBoneOverlay | null): ViewerBundle {
   const settingsBlobUrl = URL.createObjectURL(
     new Blob([JSON.stringify(buildDefaultViewerSettingsJson())], { type: "application/json" }),
   );
@@ -149,7 +207,7 @@ function buildSuperSplatViewerBundle(arrayBuffer: ArrayBuffer): ViewerBundle {
   const cssBlobUrl = URL.createObjectURL(new Blob([supersplatCss], { type: "text/css" }));
   const jsBlobUrl = URL.createObjectURL(new Blob([supersplatJs], { type: "text/javascript" }));
 
-  const htmlDoc = supersplatHtml
+  const htmlBase = supersplatHtml
     .replace('./index.css', cssBlobUrl)
     .replace("'./index.js'", `'${jsBlobUrl}'`)
     .replace(
@@ -159,7 +217,16 @@ function buildSuperSplatViewerBundle(arrayBuffer: ArrayBuffer): ViewerBundle {
     .replace(
       "const contentUrl = url.searchParams.has('content') ? url.searchParams.get('content') : './scene.compressed.ply';",
       `const contentUrl = '${contentBlobUrl}';`,
+    )
+    .replace(
+      "const viewer = await main(canvas, settingsJson, config);",
+      "const viewer = await main(canvas, settingsJson, config); window.__splatViewer = viewer;",
     );
+
+  const overlayJson = JSON.stringify(boneOverlay ?? { bones: [] });
+  const overlayScript = `\n<script>\n(() => {\n  const overlayData = ${overlayJson};\n  if (!overlayData || !Array.isArray(overlayData.bones) || overlayData.bones.length === 0) return;\n\n  const appCanvas = document.getElementById('application-canvas');\n  if (!appCanvas) return;\n\n  const overlay = document.createElement('canvas');\n  overlay.id = 'bones-overlay-canvas';\n  overlay.style.position = 'absolute';\n  overlay.style.inset = '0';\n  overlay.style.width = '100%';\n  overlay.style.height = '100%';\n  overlay.style.pointerEvents = 'none';\n  overlay.style.zIndex = '8';\n  overlay.style.mixBlendMode = 'screen';\n  document.body.appendChild(overlay);\n\n  const ctx = overlay.getContext('2d');\n  if (!ctx) return;\n\n  const resize = () => {\n    const dpr = Math.max(1, window.devicePixelRatio || 1);\n    const w = Math.max(2, Math.floor(window.innerWidth * dpr));\n    const h = Math.max(2, Math.floor(window.innerHeight * dpr));\n    if (overlay.width !== w || overlay.height !== h) {\n      overlay.width = w;\n      overlay.height = h;\n    }\n  };\n\n  const mul4 = (m, v) => {\n    return [\n      m[0] * v[0] + m[4] * v[1] + m[8] * v[2] + m[12] * v[3],\n      m[1] * v[0] + m[5] * v[1] + m[9] * v[2] + m[13] * v[3],\n      m[2] * v[0] + m[6] * v[1] + m[10] * v[2] + m[14] * v[3],\n      m[3] * v[0] + m[7] * v[1] + m[11] * v[2] + m[15] * v[3],\n    ];\n  };\n\n  const project = (x, y, z) => {\n    const viewer = window.__splatViewer;\n    const camEntity = viewer?.global?.camera;\n    const cam = camEntity?.camera;\n    if (!camEntity || !cam || !cam.viewMatrix || !cam.projectionMatrix) return null;\n\n    const view = cam.viewMatrix.data;\n    const proj = cam.projectionMatrix.data;\n    const pView = mul4(view, [x, y, z, 1]);\n    const pClip = mul4(proj, pView);\n    const w = pClip[3];\n    if (!Number.isFinite(w) || Math.abs(w) < 1e-8 || w <= 0) return null;\n\n    const nx = pClip[0] / w;\n    const ny = pClip[1] / w;\n    const nz = pClip[2] / w;\n    if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(nz)) return null;\n\n    const sx = (nx * 0.5 + 0.5) * overlay.width;\n    const sy = (1 - (ny * 0.5 + 0.5)) * overlay.height;\n    return { x: sx, y: sy, z: nz };\n  };\n\n  const draw = () => {\n    resize();\n    ctx.clearRect(0, 0, overlay.width, overlay.height);\n    const points = new Map();\n\n    for (const b of overlayData.bones) {\n      const p = project(b.position[0], b.position[1], b.position[2]);\n      if (p) points.set(b.id, p);\n    }\n\n    ctx.lineCap = 'round';\n    ctx.lineJoin = 'round';\n    ctx.lineWidth = 2;\n    ctx.shadowBlur = 8;\n    ctx.shadowColor = 'rgba(120,225,255,0.7)';\n\n    for (const b of overlayData.bones) {\n      if (b.parentId < 0) continue;\n      const a = points.get(b.parentId);\n      const c = points.get(b.id);\n      if (!a || !c) continue;\n      ctx.strokeStyle = 'rgba(112,225,255,0.9)';\n      ctx.beginPath();\n      ctx.moveTo(a.x, a.y);\n      ctx.lineTo(c.x, c.y);\n      ctx.stroke();\n    }\n\n    for (const b of overlayData.bones) {\n      const p = points.get(b.id);\n      if (!p) continue;\n      ctx.fillStyle = b.name.toLowerCase().includes('head') ? 'rgba(255,180,90,0.95)' : 'rgba(130,210,255,0.92)';\n      ctx.beginPath();\n      ctx.arc(p.x, p.y, b.name.toLowerCase().includes('pelvis') ? 4.8 : 3.4, 0, Math.PI * 2);\n      ctx.fill();\n    }\n\n    ctx.shadowBlur = 0;\n    requestAnimationFrame(draw);\n  };\n\n  window.addEventListener('resize', resize);\n  requestAnimationFrame(draw);\n})();\n</script>\n`;
+
+  const htmlDoc = htmlBase.replace('</body>', `${overlayScript}</body>`);
 
   return {
     frameHtml: htmlDoc,
@@ -1437,11 +1504,12 @@ function MiniHistogram({ title, bins }: { title: string; bins: number[] }) {
 
 async function inspectArrayBuffer(sourceName: string, arrayBuffer: ArrayBuffer, clusterCount: number) {
   const data = parseGaussianPly(arrayBuffer);
-  const segmentation = segmentRegions(data);
+  const analysisData = flipPlyForAnalysis(data);
+  const segmentation = segmentRegions(analysisData);
   const clusteringInput = samplePositionsForClustering(data);
   const clusters = kMeansClusters(clusteringInput, clusterCount, 6);
   const heatmaps = faceAndBodyHeatmaps(data, segmentation);
-  const canonicalFull = prepareCanonicalAvatar(data, segmentation);
+  const canonicalFull = prepareCanonicalAvatar(analysisData, segmentation);
   const sampled = downsampleForRigging(canonicalFull, segmentation);
   const bindRig = fitHumanoidSkeleton(sampled.canonical);
   const skinning = assignSkinningWeights(sampled.canonical, bindRig, sampled.segmentation);
@@ -1798,11 +1866,12 @@ export default function SplatWebSim3D() {
     setError(null);
     try {
       const parsed = parseGaussianPly(uploadedPly.arrayBuffer);
+      const overlay = state && viewerOverlayRig ? buildSuperSplatBoneOverlay(state.canonical, viewerOverlayRig) : null;
       setViewerData(parsed);
       setViewerMode("supersplat");
       setViewerBundle((prev) => {
         revokeViewerBundle(prev);
-        return buildSuperSplatViewerBundle(uploadedPly.arrayBuffer);
+        return buildSuperSplatViewerBundle(uploadedPly.arrayBuffer, overlay);
       });
     } catch (e) {
       setError(e instanceof Error ? e.message : "Failed to prepare SuperSplat viewer from uploaded PLY file.");

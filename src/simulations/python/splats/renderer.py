@@ -7,6 +7,21 @@ import moderngl
 import numpy as np
 import pygame
 
+# Optional gsplat integration — falls back to point-sprite renderer if not installed
+# or if the CUDA backend is unavailable (e.g. CPU-only machines / macOS without CUDA).
+try:
+    import torch as _torch
+    from gsplat import rasterization as _gsplat_rasterize
+    # gsplat sets its internal _C extension to None when CUDA is absent and prints a
+    # warning. Verify the backend is actually functional before enabling the path.
+    from gsplat.cuda import _wrapper as _gsplat_wrapper
+    _GSPLAT_AVAILABLE = getattr(_gsplat_wrapper, "_C", None) is not None
+except (ImportError, AttributeError):
+    _GSPLAT_AVAILABLE = False
+
+# World-space scale factor: maps human_generator size units (~3–10) to meters (~0.007–0.022 m).
+_GSPLAT_SCALE_FACTOR: float = 0.0022
+
 
 @dataclass
 class Camera:
@@ -255,6 +270,157 @@ class GaussianSplatRenderer:
         self.program["u_skinning_backend"].value = 1
         self.face_program["u_skinning_backend"].value = 1
 
+        # gsplat rendering path (preferred when library is installed)
+        self._use_gsplat = _GSPLAT_AVAILABLE
+        if self._use_gsplat:
+            self._init_gsplat()
+
+    # ------------------------------------------------------------------
+    # gsplat setup
+    # ------------------------------------------------------------------
+
+    def _init_gsplat(self) -> None:
+        """Set up gsplat fullscreen-blit resources and torch tensor storage."""
+        self._gsplat_device = _torch.device("cuda" if _torch.cuda.is_available() else "cpu")
+
+        # Particle tensors — populated by update_particles / update_skinning_uniforms
+        self._gsplat_bind_pos: _torch.Tensor | None = None
+        self._gsplat_quats: _torch.Tensor | None = None
+        self._gsplat_scales: _torch.Tensor | None = None
+        self._gsplat_opacities: _torch.Tensor | None = None
+        self._gsplat_colors: _torch.Tensor | None = None
+        self._gsplat_bone_idx: _torch.Tensor | None = None
+        self._gsplat_bone_w: _torch.Tensor | None = None
+        self._gsplat_palette: _torch.Tensor | None = None
+        self._gsplat_n: int = 0
+
+        # Full-screen quad that blits the gsplat RGBA texture
+        blit_vert = """
+#version 330 core
+in vec2 in_pos;
+out vec2 v_uv;
+void main() {
+    gl_Position = vec4(in_pos, 0.0, 1.0);
+    // Flip V: GL textures start at bottom-left; image tensors start at top-left.
+    v_uv = vec2(in_pos.x * 0.5 + 0.5, 1.0 - (in_pos.y * 0.5 + 0.5));
+}
+"""
+        blit_frag = """
+#version 330 core
+uniform sampler2D u_tex;
+in vec2 v_uv;
+out vec4 fragColor;
+void main() {
+    fragColor = texture(u_tex, v_uv);
+}
+"""
+        self._blit_prog = self.ctx.program(vertex_shader=blit_vert, fragment_shader=blit_frag)
+        # Two triangles (6 vertices) that cover NDC [-1, 1]
+        quad = np.array(
+            [-1.0, -1.0,  1.0, -1.0, -1.0,  1.0,
+              1.0, -1.0,  1.0,  1.0, -1.0,  1.0],
+            dtype=np.float32,
+        )
+        self._blit_vbo = self.ctx.buffer(quad.tobytes())
+        self._blit_vao = self.ctx.vertex_array(
+            self._blit_prog, [(self._blit_vbo, "2f", "in_pos")]
+        )
+        self._blit_prog["u_tex"] = 0
+        # RGBA texture; recreated lazily on resize
+        self._gsplat_tex = self.ctx.texture((self.width, self.height), 4)
+        self._gsplat_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+    # ------------------------------------------------------------------
+    # gsplat skinning (LBS in PyTorch on device)
+    # ------------------------------------------------------------------
+
+    def _apply_gsplat_skinning(self) -> _torch.Tensor:
+        """Linear blend skinning of bind positions using the current matrix palette."""
+        bp = self._gsplat_bind_pos   # (N, 3)
+        bi = self._gsplat_bone_idx   # (N, 4) int64
+        bw = self._gsplat_bone_w     # (N, 4) float32
+        pal = self._gsplat_palette   # (B, 4, 4)
+
+        N = bp.shape[0]
+        B = pal.shape[0]
+        ones = _torch.ones(N, 1, device=bp.device, dtype=_torch.float32)
+        p_h = _torch.cat([bp, ones], dim=1)  # (N, 4)
+
+        out = _torch.zeros(N, 3, device=bp.device, dtype=_torch.float32)
+        for k in range(4):
+            idx = bi[:, k].long().clamp(0, B - 1)  # (N,)
+            w = bw[:, k]                             # (N,)
+            mats = pal[idx]                          # (N, 4, 4)
+            transformed = _torch.bmm(mats, p_h.unsqueeze(-1)).squeeze(-1)  # (N, 4)
+            out += w.unsqueeze(1) * transformed[:, :3]
+        return out  # (N, 3)
+
+    # ------------------------------------------------------------------
+    # gsplat rasterization pass
+    # ------------------------------------------------------------------
+
+    def _render_gsplat(self, camera: Camera) -> None:
+        """Run gsplat rasterization and blit result as a fullscreen quad."""
+        if self._gsplat_n == 0 or self._gsplat_bind_pos is None or self._gsplat_palette is None:
+            return
+
+        dev = self._gsplat_device
+        W, H = self.width, self.height
+
+        with _torch.no_grad():
+            means = self._apply_gsplat_skinning()  # (N, 3) skinned world positions
+
+            # Convert OpenGL view matrix to OpenCV convention (flip Y and Z rows)
+            eye = camera.position
+            view_gl = look_at(eye, camera.target, np.array([0.0, 1.0, 0.0], dtype=np.float32))
+            view_cv = view_gl.copy()
+            view_cv[1, :] = -view_gl[1, :]
+            view_cv[2, :] = -view_gl[2, :]
+            viewmats = _torch.from_numpy(view_cv[None]).to(dev)  # (1, 4, 4)
+
+            # Pinhole intrinsics matching our symmetric FOV
+            fy = H / (2.0 * np.tan(self.fov_y * 0.5))
+            K = np.array([[fy, 0.0, W / 2.0],
+                           [0.0, fy, H / 2.0],
+                           [0.0, 0.0, 1.0]], dtype=np.float32)
+            Ks = _torch.from_numpy(K[None]).to(dev)  # (1, 3, 3)
+
+            # Background colour matching the GL clear colour
+            bg = _torch.tensor([[0.025, 0.030, 0.045]], device=dev, dtype=_torch.float32)
+
+            renders, alphas, _info = _gsplat_rasterize(
+                means=means,
+                quats=self._gsplat_quats,
+                scales=self._gsplat_scales,
+                opacities=self._gsplat_opacities,
+                colors=self._gsplat_colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=W,
+                height=H,
+                near_plane=0.05,
+                far_plane=50.0,
+                render_mode="RGB",
+                backgrounds=bg,
+            )
+            # renders: (1, H, W, 3); alphas: (1, H, W, 1)
+            rgb = renders[0]
+            alpha = alphas[0]
+            rgba = _torch.cat([rgb, alpha], dim=-1).clamp(0.0, 1.0)
+            rgba_np = (rgba * 255).to(_torch.uint8).cpu().numpy()  # (H, W, 4) uint8
+
+        # Recreate texture on viewport resize
+        if self._gsplat_tex.width != W or self._gsplat_tex.height != H:
+            self._gsplat_tex.release()
+            self._gsplat_tex = self.ctx.texture((W, H), 4)
+            self._gsplat_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+
+        self._gsplat_tex.write(rgba_np.tobytes())
+        self._gsplat_tex.use(0)
+        self.ctx.disable(moderngl.DEPTH_TEST)
+        self._blit_vao.render(moderngl.TRIANGLES)
+        self.ctx.enable(moderngl.DEPTH_TEST)
+
     def _build_wire_mesh_plane(self, size: float, step: float) -> tuple[moderngl.Buffer, moderngl.VertexArray, int]:
         verts: list[float] = []
 
@@ -361,6 +527,32 @@ class GaussianSplatRenderer:
         self.particle_count = body_count
         self.face_particle_count = face_count
 
+        # Store all-particle tensors for gsplat (body + face combined, before split)
+        if self._use_gsplat:
+            dev = self._gsplat_device
+            N = count
+            all_bind = bind_world_positions.astype(np.float32, copy=False)
+            all_colors = colors.astype(np.float32, copy=False)
+            all_sizes = sizes.astype(np.float32, copy=False)
+            all_brightness = brightness.astype(np.float32, copy=False)
+            all_bi = bone_indices.reshape(N, -1)[:, :4].astype(np.int32, copy=False)
+            all_bw = bone_weights.reshape(N, -1)[:, :4].astype(np.float32, copy=False)
+
+            self._gsplat_bind_pos = _torch.from_numpy(all_bind).to(dev)
+            self._gsplat_colors = _torch.from_numpy(all_colors).to(dev)
+            # Identity quaternions [w, x, y, z] = [1, 0, 0, 0] — isotropic Gaussians
+            q = _torch.zeros(N, 4, device=dev, dtype=_torch.float32)
+            q[:, 0] = 1.0
+            self._gsplat_quats = q
+            # Isotropic scale derived from per-particle size; contiguous for gsplat
+            s = _torch.from_numpy(all_sizes).to(dev)
+            self._gsplat_scales = (s.unsqueeze(1).expand(-1, 3) * _GSPLAT_SCALE_FACTOR).contiguous()
+            # Opacity from brightness clamped to [0, 1]
+            self._gsplat_opacities = _torch.from_numpy(all_brightness).to(dev).clamp(0.05, 1.0)
+            self._gsplat_bone_idx = _torch.from_numpy(all_bi).to(dev)
+            self._gsplat_bone_w = _torch.from_numpy(all_bw).to(dev)
+            self._gsplat_n = N
+
     def update_skinning_uniforms(self, matrix_palette: np.ndarray, backend: str = "gpu") -> None:
         palette = matrix_palette.astype(np.float32, copy=False)
         if palette.shape != (self.max_bones, 4, 4):
@@ -369,6 +561,8 @@ class GaussianSplatRenderer:
         self.program["u_skinning_backend"].value = 1 if backend == "gpu" else 0
         self.face_program["u_bone_mats"].write(palette.transpose(0, 2, 1).tobytes())
         self.face_program["u_skinning_backend"].value = 1 if backend == "gpu" else 0
+        if self._use_gsplat:
+            self._gsplat_palette = _torch.from_numpy(palette).to(self._gsplat_device)
 
     def update_bone_lines(self, bone_positions: np.ndarray, parents: np.ndarray, enabled: bool) -> None:
         if not enabled:
@@ -416,30 +610,42 @@ class GaussianSplatRenderer:
         proj = perspective(self.fov_y, self.width / self.height, 0.05, 50.0)
         mvp = proj @ view
 
-        point_scale = self.height / (2.0 * np.tan(self.fov_y * 0.5))
+        if self._use_gsplat:
+            # gsplat produces a properly depth-sorted, alpha-composited image.
+            self._render_gsplat(camera)
+        else:
+            # Fallback: ModernGL point-sprite Gaussians.
+            point_scale = self.height / (2.0 * np.tan(self.fov_y * 0.5))
+            self.program["u_mvp"].write(mvp.T.astype("f4").tobytes())
+            self.program["u_view"].write(view.T.astype("f4").tobytes())
+            self.program["u_point_scale"].value = float(point_scale)
+            self.face_program["u_mvp"].write(mvp.T.astype("f4").tobytes())
+            self.face_program["u_view"].write(view.T.astype("f4").tobytes())
+            self.face_program["u_point_scale"].value = float(point_scale)
+            if self.particle_count > 0:
+                self.vao.render(mode=moderngl.POINTS, vertices=self.particle_count)
+            if self.face_particle_count > 0:
+                self.face_vao.render(mode=moderngl.POINTS, vertices=self.face_particle_count)
 
-        self.program["u_mvp"].write(mvp.T.astype("f4").tobytes())
-        self.program["u_view"].write(view.T.astype("f4").tobytes())
-        self.program["u_point_scale"].value = float(point_scale)
-        self.face_program["u_mvp"].write(mvp.T.astype("f4").tobytes())
-        self.face_program["u_view"].write(view.T.astype("f4").tobytes())
-        self.face_program["u_point_scale"].value = float(point_scale)
-
-        # Draw orientation guides first so splats naturally overlay them.
+        # Draw orientation guides last as overlays (depth test off so they
+        # are always visible regardless of the splat depth buffer).
+        self.ctx.disable(moderngl.DEPTH_TEST)
         self.line_program["u_mvp"].write(mvp.T.astype("f4").tobytes())
         self.grid_vao.render(mode=moderngl.LINES, vertices=self.grid_vertex_count)
         if show_bones and self.bone_vertex_count > 0:
             self.bone_vao.render(mode=moderngl.LINES, vertices=self.bone_vertex_count)
         if show_ik_debug and self.ik_vertex_count > 0:
             self.ik_vao.render(mode=moderngl.LINES, vertices=self.ik_vertex_count)
+        self.ctx.enable(moderngl.DEPTH_TEST)
 
-        if self.particle_count > 0:
-            self.vao.render(mode=moderngl.POINTS, vertices=self.particle_count)
-        if self.face_particle_count > 0:
-            self.face_vao.render(mode=moderngl.POINTS, vertices=self.face_particle_count)
         pygame.display.flip()
 
     def shutdown(self) -> None:
+        if self._use_gsplat:
+            self._blit_vao.release()
+            self._blit_vbo.release()
+            self._blit_prog.release()
+            self._gsplat_tex.release()
         self.ik_vao.release()
         self.ik_vbo.release()
         self.bone_vao.release()

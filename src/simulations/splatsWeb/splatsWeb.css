@@ -210,6 +210,64 @@
   cursor: grab;
 }
 
+.viewer-canvas-wrap {
+  position: relative;
+}
+
+.viewer-overlay-panel {
+  position: absolute;
+  right: 12px;
+  top: 22px;
+  width: min(360px, calc(100% - 24px));
+  max-height: min(72vh, 620px);
+  overflow: auto;
+  border: 1px solid rgba(112, 157, 184, 0.52);
+  border-radius: 10px;
+  background: rgba(5, 16, 28, 0.9);
+  backdrop-filter: blur(4px);
+  padding: 10px;
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.4);
+}
+
+.viewer-overlay-panel h4 {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: #c8e7f6;
+  letter-spacing: 0.02em;
+}
+
+.viewer-overlay-panel label {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  margin-bottom: 8px;
+  font-size: 12px;
+  color: #a9cfdf;
+}
+
+.viewer-overlay-panel input[type="range"] {
+  width: 100%;
+}
+
+.viewer-overlay-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 6px;
+}
+
+.viewer-overlay-actions button {
+  flex: 1;
+}
+
+@media (max-width: 820px) {
+  .viewer-overlay-panel {
+    position: static;
+    width: 100%;
+    max-height: none;
+    margin-top: 8px;
+  }
+}
+
 .supersplat-frame {
   width: 100%;
   height: min(78vh, 760px);

@@ -211,82 +211,6 @@ export default function PlySplatViewerSection({
                 <option value="blend">Blended Skinning Weights</option>
               </select>
             </label>
-            {selectedBoneId !== null && (
-              <>
-                <label>
-                  <span>Bone Move X: {selectedBoneEdit.tx.toFixed(3)}</span>
-                  <input
-                    type="range"
-                    min={-0.5}
-                    max={0.5}
-                    step={0.001}
-                    value={selectedBoneEdit.tx}
-                    onChange={(e) => onSelectedBoneEditChange("tx", Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  <span>Bone Move Y: {selectedBoneEdit.ty.toFixed(3)}</span>
-                  <input
-                    type="range"
-                    min={-0.5}
-                    max={0.5}
-                    step={0.001}
-                    value={selectedBoneEdit.ty}
-                    onChange={(e) => onSelectedBoneEditChange("ty", Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  <span>Bone Move Z: {selectedBoneEdit.tz.toFixed(3)}</span>
-                  <input
-                    type="range"
-                    min={-0.5}
-                    max={0.5}
-                    step={0.001}
-                    value={selectedBoneEdit.tz}
-                    onChange={(e) => onSelectedBoneEditChange("tz", Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  <span>Bone Rotate X: {selectedBoneEdit.rxDeg.toFixed(1)} deg</span>
-                  <input
-                    type="range"
-                    min={-180}
-                    max={180}
-                    step={0.1}
-                    value={selectedBoneEdit.rxDeg}
-                    onChange={(e) => onSelectedBoneEditChange("rxDeg", Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  <span>Bone Rotate Y: {selectedBoneEdit.ryDeg.toFixed(1)} deg</span>
-                  <input
-                    type="range"
-                    min={-180}
-                    max={180}
-                    step={0.1}
-                    value={selectedBoneEdit.ryDeg}
-                    onChange={(e) => onSelectedBoneEditChange("ryDeg", Number(e.target.value))}
-                  />
-                </label>
-                <label>
-                  <span>Bone Rotate Z: {selectedBoneEdit.rzDeg.toFixed(1)} deg</span>
-                  <input
-                    type="range"
-                    min={-180}
-                    max={180}
-                    step={0.1}
-                    value={selectedBoneEdit.rzDeg}
-                    onChange={(e) => onSelectedBoneEditChange("rzDeg", Number(e.target.value))}
-                  />
-                </label>
-                <button type="button" onClick={onResetSelectedBonePose}>
-                  Reset Selected Bone Pose
-                </button>
-                <button type="button" onClick={onResetAllBonePose}>
-                  Reset All Bone Poses
-                </button>
-              </>
-            )}
             <label>
               <span>Splat Opacity: {Math.round(splatOpacity * 100)}%</span>
               <input
@@ -398,17 +322,98 @@ export default function PlySplatViewerSection({
               Left drag: orbit. Right drag or Shift+drag: pan. Wheel: zoom. Bone axes are RGB (X red, Y green, Z blue).
             </p>
           )}
-          <canvas
-            ref={canvasRef}
-            className="splat-viewer-canvas"
-            onPointerDown={onPointerDown}
-            onPointerMove={onPointerMove}
-            onPointerUp={onPointerUp}
-            onPointerCancel={onPointerUp}
-            onPointerLeave={onPointerUp}
-            onWheel={onWheel}
-            onContextMenu={(e) => e.preventDefault()}
-          />
+          <div className="viewer-canvas-wrap">
+            <canvas
+              ref={canvasRef}
+              className="splat-viewer-canvas"
+              onPointerDown={onPointerDown}
+              onPointerMove={onPointerMove}
+              onPointerUp={onPointerUp}
+              onPointerCancel={onPointerUp}
+              onPointerLeave={onPointerUp}
+              onWheel={onWheel}
+              onContextMenu={(e) => e.preventDefault()}
+            />
+            {selectedBoneId !== null && (
+              <div className="viewer-overlay-panel">
+                <h4>Selected Bone Controls</h4>
+                <label>
+                  <span>Move X: {selectedBoneEdit.tx.toFixed(3)}</span>
+                  <input
+                    type="range"
+                    min={-0.5}
+                    max={0.5}
+                    step={0.001}
+                    value={selectedBoneEdit.tx}
+                    onChange={(e) => onSelectedBoneEditChange("tx", Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  <span>Move Y: {selectedBoneEdit.ty.toFixed(3)}</span>
+                  <input
+                    type="range"
+                    min={-0.5}
+                    max={0.5}
+                    step={0.001}
+                    value={selectedBoneEdit.ty}
+                    onChange={(e) => onSelectedBoneEditChange("ty", Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  <span>Move Z: {selectedBoneEdit.tz.toFixed(3)}</span>
+                  <input
+                    type="range"
+                    min={-0.5}
+                    max={0.5}
+                    step={0.001}
+                    value={selectedBoneEdit.tz}
+                    onChange={(e) => onSelectedBoneEditChange("tz", Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  <span>Rotate X: {selectedBoneEdit.rxDeg.toFixed(1)} deg</span>
+                  <input
+                    type="range"
+                    min={-360}
+                    max={360}
+                    step={0.1}
+                    value={selectedBoneEdit.rxDeg}
+                    onChange={(e) => onSelectedBoneEditChange("rxDeg", Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  <span>Rotate Y: {selectedBoneEdit.ryDeg.toFixed(1)} deg</span>
+                  <input
+                    type="range"
+                    min={-360}
+                    max={360}
+                    step={0.1}
+                    value={selectedBoneEdit.ryDeg}
+                    onChange={(e) => onSelectedBoneEditChange("ryDeg", Number(e.target.value))}
+                  />
+                </label>
+                <label>
+                  <span>Rotate Z: {selectedBoneEdit.rzDeg.toFixed(1)} deg</span>
+                  <input
+                    type="range"
+                    min={-360}
+                    max={360}
+                    step={0.1}
+                    value={selectedBoneEdit.rzDeg}
+                    onChange={(e) => onSelectedBoneEditChange("rzDeg", Number(e.target.value))}
+                  />
+                </label>
+                <div className="viewer-overlay-actions">
+                  <button type="button" onClick={onResetSelectedBonePose}>
+                    Reset Bone
+                  </button>
+                  <button type="button" onClick={onResetAllBonePose}>
+                    Reset All
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
         </>
       )}
 

@@ -36,3 +36,4 @@ coverage
 *.sw?
 src/simulations/splats/__pycache__/
 *.zip
+src/simulations/python/splats/__pycache__/
